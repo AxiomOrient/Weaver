@@ -194,7 +194,9 @@ public actor WeaverContainer: Resolver {
                 }
                 return typedInstance
             } else if let parent = parent {
-                return try await parent.resolve(key: key, as: T.self)
+                return try await Self.$resolutionStack.withValue([]) {
+                    try await parent.resolve(key: key, as: T.self)
+                }
             } else {
                 throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
             }
@@ -214,6 +216,8 @@ public actor WeaverContainer: Resolver {
             case .transient:
                 instance = try await registration.factory(self)
             }
+        } catch let error as WeaverError {
+            throw error
         } catch {
             throw WeaverError.resolutionFailed(.factoryFailed(keyName: registration.keyName, underlying: error))
         }
@@ -255,28 +259,42 @@ internal actor ScopeManager {
     init(logger: WeaverLogger?) { self.logger = logger }
     
     func getOrCreateInstance<T: Sendable>(key: AnyDependencyKey, factory: @Sendable @escaping () async throws -> T) async throws -> T {
-        if let cachedInstance = containerCache[key] as? T { return cachedInstance }
-        
-        if let existingTask = ongoingCreations[key] {
-            let result = try await existingTask.value
-            guard let typedResult = result as? T else {
-                throw WeaverError.resolutionFailed(.typeMismatch(expected: "\(T.self)", actual: "\(Swift.type(of: result))", keyName: key.description))
+        if let cachedInstance = containerCache[key] {
+            guard let typedInstance = cachedInstance as? T else {
+                throw WeaverError.resolutionFailed(.typeMismatch(expected: "\(T.self)", actual: "\(Swift.type(of: cachedInstance))", keyName: key.description))
             }
-            return typedResult
+            return typedInstance
         }
-        
-        let creationTask = Task<any Sendable, Error> { try await factory() }
-        ongoingCreations[key] = creationTask
-        defer { ongoingCreations[key] = nil }
-        
-        do {
-            let instance = try await creationTask.value
+
+        if let existingTask = ongoingCreations[key] {
+            let instance = try await existingTask.value
             guard let typedInstance = instance as? T else {
                 throw WeaverError.resolutionFailed(.typeMismatch(expected: "\(T.self)", actual: "\(Swift.type(of: instance))", keyName: key.description))
             }
-            containerCache[key] = typedInstance
+            return typedInstance
+        }
+
+        let creationTask = Task<any Sendable, Error> {
+            do {
+                let instance = try await factory()
+                containerCache[key] = instance
+                return instance
+            } catch {
+                throw error
+            }
+        }
+        
+        ongoingCreations[key] = creationTask
+        
+        do {
+            let instance = try await creationTask.value
+            ongoingCreations[key] = nil
+            guard let typedInstance = instance as? T else {
+                throw WeaverError.resolutionFailed(.typeMismatch(expected: "\(T.self)", actual: "\(Swift.type(of: instance))", keyName: key.description))
+            }
             return typedInstance
         } catch {
+            ongoingCreations[key] = nil
             throw error
         }
     }
@@ -385,7 +403,7 @@ public struct DefaultDependencyScope: DependencyScope {
     @TaskLocal private static var _current: WeaverContainer?
     
     public var current: WeaverContainer? {
-        Self._current
+        get { Self._current }
     }
     
     public func withScope<R: Sendable>(_ container: WeaverContainer, operation: @Sendable () async throws -> R) async rethrows -> R {

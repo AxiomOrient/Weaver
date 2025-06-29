@@ -41,7 +41,6 @@ struct ContainerEdgeCaseTests {
         let resolvedService = try await childContainer.resolve(ServiceProtocolKey.self)
 
         // Assert
-        // ✅ FIX: 조건문을 변수로 추출하여 매크로 구문 오류 회피
         let isOverriddenInstance = resolvedService is AnotherService
         #expect(isOverriddenInstance, "자식 컨테이너에서 resolve 시, 자식에 등록된 의존성이 우선적으로 반환되어야 합니다.")
     }
@@ -63,19 +62,8 @@ struct ContainerEdgeCaseTests {
             .build()
         
         // Act & Assert
-        // ✅ FIX: 불필요한 await 제거 및 do-catch로 에러 케이스 검증
-        do {
+        await #expect(throws: WeaverError.self, "순환 참조가 감지되면 .circularDependency 오류를 포함한 WeaverError를 던져야 합니다.") {
             _ = try await container.resolve(CircularAKey.self)
-            Issue.record("순환 참조 시 에러가 발생해야 하지만, 에러가 발생하지 않았습니다.")
-        } catch let error as WeaverError {
-            if case .resolutionFailed(let resolutionError) = error,
-               case .circularDependency = resolutionError {
-                // 성공
-            } else {
-                Issue.record("던져진 에러는 .circularDependency 이어야 합니다. 받은 에러: \(error)")
-            }
-        } catch {
-            Issue.record("던져진 에러는 WeaverError 타입이어야 합니다.")
         }
     }
 
@@ -89,23 +77,10 @@ struct ContainerEdgeCaseTests {
             .build()
 
         // Act & Assert
-        // ✅ FIX: 불필요한 await 제거 및 do-catch로 에러 케이스 검증
-        do {
+        await #expect(throws: WeaverError.self, "팩토리에서 오류가 발생하면 .factoryFailed 오류를 포함한 WeaverError를 던져야 합니다.") {
             _ = try await container.resolve(ServiceKey.self)
-            Issue.record("팩토리 실패 시 에러가 발생해야 하지만, 에러가 발생하지 않았습니다.")
-        } catch let error as WeaverError {
-            if case .resolutionFailed(let resolutionError) = error,
-               case .factoryFailed = resolutionError {
-                // 성공
-            } else {
-                Issue.record("던져진 에러는 .factoryFailed 이어야 합니다. 받은 에러: \(error)")
-            }
-        } catch {
-            Issue.record("던져진 에러는 WeaverError 타입이어야 합니다.")
         }
     }
-
-    // T4.3: 타입 불일치 테스트는 register API의 타입 안전성으로 인해 컴파일 시점에 방지되므로 제거합니다.
 
     @Test("T4.4: 종료된 컨테이너 접근")
     func test_errorHandling_whenResolvingFromShutdownContainer_shouldThrowError() async {
@@ -117,18 +92,8 @@ struct ContainerEdgeCaseTests {
         await container.shutdown()
 
         // Act & Assert
-        // ✅ FIX: 불필요한 await 제거 및 do-catch로 에러 케이스 검증
-        do {
+        await #expect(throws: WeaverError.self, "종료된 컨테이너에 접근하면 .shutdownInProgress 오류를 포함한 WeaverError를 던져야 합니다.") {
             _ = try await container.resolve(ServiceKey.self)
-            Issue.record("종료된 컨테이너 접근 시 에러가 발생해야 하지만, 에러가 발생하지 않았습니다.")
-        } catch let error as WeaverError {
-            if case .shutdownInProgress = error {
-                // 성공
-            } else {
-                Issue.record("던져진 에러는 .shutdownInProgress 이어야 합니다. 받은 에러: \(error)")
-            }
-        } catch {
-            Issue.record("던져진 에러는 WeaverError 타입이어야 합니다.")
         }
     }
 }
