@@ -77,7 +77,7 @@ struct ConcurrencyTests {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for key in keys {
                 group.addTask {
-                    // ✅ FIX: 반환된 `any Sendable`을 올바른 타입으로 캐스팅합니다.
+                    
                     let value = try await container.resolve(key)
                     #expect(value is Int)
                 }

@@ -70,9 +70,9 @@ public protocol MetricsCollecting: Sendable {
 
 /// 캐시 로직을 관리하는 기능을 정의하는 프로토콜입니다.
 public protocol CacheManaging: Sendable {
-    /// 캐시에서 인스턴스를 가져오거나, 없는 경우 `factory`를 통해 생성하고 캐시에 저장합니다.
-    /// - Returns: 해결된 인스턴스와 캐시 히트 여부를 담은 튜플 `(value: T, isHit: Bool)`.
-    func getOrCreateInstance<T: Sendable>(key: AnyDependencyKey, factory: @Sendable @escaping () async throws -> T) async throws -> (value: T, isHit: Bool)
+    /// 캐시에서 인스턴스를 생성하는 Task와 캐시 히트 여부를 반환합니다.
+    /// - Returns: 인스턴스를 생성하는 Task와 캐시 히트 여부를 담은 튜플 `(task: Task<T, Error>, isHit: Bool)`.
+    func taskForInstance<T: Sendable>(key: AnyDependencyKey, factory: @Sendable @escaping () async throws -> T) async -> (task: Task<any Sendable, Error>, isHit: Bool)
     
     /// 현재 캐시의 히트/미스 메트릭을 반환합니다.
     func getMetrics() async -> (hits: Int, misses: Int)

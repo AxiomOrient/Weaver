@@ -17,7 +17,7 @@ Weaver is a next-generation Dependency Injection container for Swift, meticulous
 - **Modular by Design**: Organize dependencies into logical `Module`s that mirror your app's features, preventing the "massive dependency file" problem and improving maintainability.
 - **Type-Safe Resolution**: Leverage the Swift compiler to catch dependency errors at build time, not runtime. Say goodbye to unexpected `nil` values and type-casting errors.
 - **Elegant `@Inject` Wrapper**: Declare dependencies effortlessly with a clean and intuitive property wrapper. Your business logic remains pure and focused, free from boilerplate DI code.
-- **Powerful Scoping**: Fine-grained control over object lifecycles with `.container` (singleton), `.cached` (time- or policy-based), and `.transient` (new instance every time) scopes.
+- **Powerful Scoping**: Fine-grained control over object lifecycles with `.container` (singleton), `.cached` (time- or policy-based) scopes.
 - **Hierarchical Containers**: Override dependencies with ease for testing, feature flagging, or different environments. Create child containers that inherit from and extend parent configurations.
 - **Insightful Tooling**: Analyze container performance with built-in metrics and visualize your architecture with auto-generated dependency graphs.
 

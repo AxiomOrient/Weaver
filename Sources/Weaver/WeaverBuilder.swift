@@ -1,7 +1,6 @@
 // WeaverBuilder.swift
 
 import Foundation
-import os.log
 
 /// `WeaverContainer`를 생성하기 위한 빌더 액터입니다.
 ///
@@ -28,13 +27,13 @@ public actor WeaverBuilder {
     /// 동일한 키에 대해 중복 등록할 경우, 기존 등록 내용을 덮어쓰고 경고 로그를 출력합니다.
     /// - Parameters:
     ///   - keyType: 등록할 의존성의 키 타입 (`DependencyKey.Type`).
-    ///   - scope: 의존성의 생명주기를 정의하는 스코프 (`.container`, `.cached`, `.transient`). 기본값은 `.transient`.
+    ///   - scope: 의존성의 생명주기를 정의하는 스코프 (`.container`, `.cached`). 기본값은 `.container`.
     ///   - factory: 의존성 인스턴스를 생성하는 클로저. `Resolver`를 통해 다른 의존성을 주입받을 수 있습니다.
     /// - Returns: 체이닝을 위해 빌더 자신(`Self`)을 반환합니다.
     @discardableResult
     public func register<Key: DependencyKey>(
         _ keyType: Key.Type,
-        scope: Scope = .transient,
+        scope: Scope = .container,
         factory: @escaping @Sendable (Resolver) async throws -> Key.Value
     ) -> Self {
         let key = AnyDependencyKey(keyType)
@@ -43,9 +42,7 @@ public actor WeaverBuilder {
             factory: { resolver in try await factory(resolver) },
             keyName: String(describing: keyType)
         )
-        if registrations[key] != nil {
-            Task { await logger.log(message: "⚠️ 경고: '\(key.description)'에 대한 등록을 덮어씁니다.", level: .default) }
-        }
+        
         registrations[key] = registration
         return self
     }

@@ -65,7 +65,6 @@ public struct DependencyGraph: Sendable {
             let color: String = switch registration.scope {
             case .container: "lightgreen"
             case .cached: "khaki"
-            case .transient: "lightblue"
             }
             dot += "  \"\(key.description)\" [fillcolor=\(color), style=filled];\n"
         }
@@ -94,6 +93,10 @@ public struct CachePolicy: Sendable {
     public let evictionPolicy: EvictionPolicy
     
     public init(maxSize: Int = 100, ttl: TimeInterval = 300, evictionPolicy: EvictionPolicy = .lru) {
+        // 개발 중 잘못된 설정값을 즉시 발견하여 런타임 오류를 방지합니다.
+        precondition(maxSize > 0, "CachePolicy의 maxSize는 반드시 0보다 커야 합니다.")
+        precondition(ttl > 0, "CachePolicy의 ttl은 반드시 0보다 커야 합니다.")
+
         self.maxSize = maxSize
         self.ttl = ttl
         self.evictionPolicy = evictionPolicy
@@ -109,6 +112,7 @@ actor DefaultCacheManager: CacheManaging {
     private let policy: CachePolicy
     private let logger: WeaverLogger?
     private var cache: [AnyDependencyKey: CacheEntry] = [:]
+    private var ongoingCreations: [AnyDependencyKey: Task<any Sendable, Error>] = [:]
     private let accessList = DoublyLinkedList()
     private var expirationHeap = PriorityQueue<ExpirationEntry>()
     private let memoryMonitor = MemoryMonitor()
@@ -126,13 +130,15 @@ actor DefaultCacheManager: CacheManaging {
     func clear() async {
         await memoryMonitor.stop()
         cache.removeAll()
+        ongoingCreations.values.forEach { $0.cancel() }
+        ongoingCreations.removeAll()
         accessList.clear()
         expirationHeap.clear()
         cacheHits = 0
         cacheMisses = 0
     }
     
-    func getOrCreateInstance<T: Sendable>(key: AnyDependencyKey, factory: @Sendable @escaping () async throws -> T) async throws -> (value: T, isHit: Bool) {
+    func taskForInstance<T: Sendable>(key: AnyDependencyKey, factory: @Sendable @escaping () async throws -> T) async -> (task: Task<any Sendable, Error>, isHit: Bool) {
         // 메모리 압박 상황 처리
         if await memoryMonitor.isUnderPressure {
             await logger?.log(message: "⚠️ 경고: 메모리 압박 감지. 캐시의 25%를 제거합니다.", level: .default)
@@ -142,20 +148,39 @@ actor DefaultCacheManager: CacheManaging {
         // 만료된 항목 제거
         evictExpiredEntries()
         
-        // 캐시에서 인스턴스 조회
+        // 1. 캐시에서 인스턴스 조회
         if let entry = cache[key], let value = entry.value as? T {
             if policy.evictionPolicy == .lru {
                 accessList.moveToFront(key: key)
             }
             cacheHits += 1
-            return (value, true)
+            return (Task { value }, true)
         }
-        
-        // 캐시 미스: 새로운 인스턴스 생성
+
+        // 2. 진행 중인 Task가 있는지 확인
+        if let existingTask = ongoingCreations[key] {
+            return (existingTask, false)
+        }
+
+        // 3. 새로운 Task 생성 및 등록
         cacheMisses += 1
-        let instance = try await factory()
-        addInstanceToCache(instance, forKey: key)
-        return (instance, false)
+        let newTask = Task<any Sendable, Error> {
+            do {
+                let instance = try await factory()
+                addInstanceToCache(instance, forKey: key)
+                await removeOngoingCreation(forKey: key)
+                return instance
+            } catch {
+                await removeOngoingCreation(forKey: key)
+                throw error
+            }
+        }
+        ongoingCreations[key] = newTask
+        return (newTask, false)
+    }
+    
+    private func removeOngoingCreation(forKey key: AnyDependencyKey) async {
+        ongoingCreations.removeValue(forKey: key)
     }
     
     func getMetrics() -> (hits: Int, misses: Int) {
