@@ -30,7 +30,7 @@ Weaver is a next-generation Dependency Injection container for Swift, meticulous
 Add `Weaver` to your project by including it in your `Package.swift` file's `dependencies` array.
 
 ```swift
-.package(url: "https://github.com/axient/Weaver.git", from: "1.0.0")
+.package(url: "https://github.com/AxiomOrient/Weaver.git", from: "0.0.2")
 ```
 
 Then, add `"Weaver"` to your target's `dependencies`.
