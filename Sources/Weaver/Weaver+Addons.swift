@@ -113,7 +113,8 @@ actor DefaultCacheManager: CacheManaging {
     private let logger: WeaverLogger?
     private var cache: [AnyDependencyKey: CacheEntry] = [:]
     private var ongoingCreations: [AnyDependencyKey: Task<any Sendable, Error>] = [:]
-    private let accessList = DoublyLinkedList()
+    /// LRU와 FIFO 정책 모두를 위한 퇴출 순서 추적기입니다.
+    private let evictionOrderTracker = DoublyLinkedList()
     private var expirationHeap = PriorityQueue<ExpirationEntry>()
     private let memoryMonitor = MemoryMonitor()
     private var cacheHits = 0
@@ -132,7 +133,7 @@ actor DefaultCacheManager: CacheManaging {
         cache.removeAll()
         ongoingCreations.values.forEach { $0.cancel() }
         ongoingCreations.removeAll()
-        accessList.clear()
+        evictionOrderTracker.clear()
         expirationHeap.clear()
         cacheHits = 0
         cacheMisses = 0
@@ -151,7 +152,8 @@ actor DefaultCacheManager: CacheManaging {
         // 1. 캐시에서 인스턴스 조회
         if let entry = cache[key], let value = entry.value as? T {
             if policy.evictionPolicy == .lru {
-                accessList.moveToFront(key: key)
+                // LRU 정책은 접근 시 순서를 갱신하여 가장 최근에 사용되었음을 표시합니다.
+                evictionOrderTracker.moveToFront(key: key)
             }
             cacheHits += 1
             return (Task { value }, true)
@@ -194,9 +196,9 @@ actor DefaultCacheManager: CacheManaging {
         let entry = CacheEntry(value: instance, ttl: policy.ttl)
         cache[key] = entry
         
-        if policy.evictionPolicy == .lru {
-            accessList.add(key)
-        }
+        // LRU와 FIFO 모두 퇴출 순서 추적을 위해 리스트에 추가합니다.
+        // LRU는 접근 시 순서가 갱신되고, FIFO는 추가된 순서가 그대로 유지됩니다.
+        evictionOrderTracker.add(key)
         expirationHeap.enqueue(ExpirationEntry(key: key, expirationDate: entry.expirationDate, creationDate: entry.createdAt))
     }
     
@@ -218,20 +220,17 @@ actor DefaultCacheManager: CacheManaging {
     private func evict(count: Int = 1) {
         for _ in 0..<count {
             guard !cache.isEmpty else { break }
-            switch policy.evictionPolicy {
-            case .lru:
-                if let key = accessList.removeTail() { removeFromCache(key: key) }
-            case .fifo:
-                if let key = cache.min(by: { $0.value.createdAt < $1.value.createdAt })?.key { removeFromCache(key: key) }
+            // LRU와 FIFO 정책 모두 가장 오래된 항목(리스트의 꼬리)을 제거합니다.
+            if let keyToEvict = evictionOrderTracker.removeTail() {
+                removeFromCache(key: keyToEvict)
             }
         }
     }
     
     private func removeFromCache(key: AnyDependencyKey) {
         if cache.removeValue(forKey: key) != nil {
-            if policy.evictionPolicy == .lru {
-                accessList.remove(key: key)
-            }
+            // 캐시에서 제거되면 순서 추적 리스트에서도 일관되게 제거합니다.
+            evictionOrderTracker.remove(key: key)
         }
     }
 }

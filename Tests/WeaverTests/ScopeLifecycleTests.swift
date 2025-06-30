@@ -103,4 +103,31 @@ struct ScopeLifecycleTests {
         #expect(instance1_first.id != instance1_second.id, "캐시 크기 초과 시 가장 오래된 인스턴스는 제거되고 새로 생성되어야 합니다.")
     }
 
+    @Test("T2.7: .cached 스코프 (FIFO) - 카운트 제한 시 가장 먼저 들어온 인스턴스 제거")
+    func test_cachedScope_whenFIFOAndCountLimitExceeded_shouldEvictFirstInInstance() async throws {
+        // Arrange
+        let policy = CachePolicy(maxSize: 2, evictionPolicy: .fifo) // FIFO 정책, 캐시 크기 2
+        let container = await WeaverContainer.builder()
+            .enableAdvancedCaching(policy: policy)
+            .register(ServiceKey.self, scope: .cached) { _ in TestService() }
+            .register(ServiceProtocolKey.self, scope: .cached) { _ in AnotherService() }
+            .register(DisposableServiceKey.self, scope: .cached) { _ in DisposableService(onDispose: {}) }
+            .build()
+
+        // Act
+        // 1. ServiceKey를 캐시에 추가 (가장 먼저 들어옴)
+        let instance1_first = try await container.resolve(ServiceKey.self)
+        
+        // 2. ServiceProtocolKey를 캐시에 추가 (캐시가 꽉 참)
+        _ = try await container.resolve(ServiceProtocolKey.self)
+        
+        // 3. DisposableServiceKey를 캐시에 추가. 이로 인해 가장 먼저 들어온 ServiceKey가 제거되어야 함.
+        _ = try await container.resolve(DisposableServiceKey.self)
+        
+        // 4. ServiceKey를 다시 resolve. 캐시에서 제거되었으므로 새로운 인스턴스가 생성되어야 함.
+        let instance1_second = try await container.resolve(ServiceKey.self)
+
+        // Assert
+        #expect(instance1_first.id != instance1_second.id, "FIFO 정책에 따라 가장 먼저 캐시된 인스턴스는 제거되고 새로 생성되어야 합니다.")
+    }
 }

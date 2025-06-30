@@ -37,6 +37,10 @@ public actor WeaverBuilder {
         factory: @escaping @Sendable (Resolver) async throws -> Key.Value
     ) -> Self {
         let key = AnyDependencyKey(keyType)
+        if registrations[key] != nil {
+            // Task로 감싸서 로깅이 빌더의 동기적 흐름을 막지 않도록 합니다.
+            Task { await logger.log(message: "경고: '\(key.description)' 키에 대한 의존성이 중복 등록되어 기존 내용을 덮어씁니다.", level: .debug) }
+        }
         let registration = DependencyRegistration(
             scope: scope,
             factory: { resolver in try await factory(resolver) },
