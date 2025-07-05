@@ -48,9 +48,6 @@ public enum Weaver {
 @propertyWrapper
 public struct Inject<Key: DependencyKey>: Sendable {
     private let keyType: Key.Type
-    
-    // 각 인스턴스별로 의존성 해결 결과를 한 번만 저장하여 성능을 최적화하는 내부 저장소입니다.
-    private let storage = ValueStorage<Key.Value>()
 
     public init(_ keyType: Key.Type) {
         self.keyType = keyType
@@ -63,10 +60,7 @@ public struct Inject<Key: DependencyKey>: Sendable {
 
     /// `$myService`와 같이 ` 접두사를 통해 접근하는 projectedValue는 에러를 던지는(throwing) API 등 대체 기능을 제공합니다.
     public var projectedValue: InjectProjection<Key> {
-        InjectProjection(
-            keyType: keyType,
-            storage: storage
-        )
+        InjectProjection(keyType: keyType)
     }
 
     /// 기본 의존성 접근 방식입니다. `await myService()`와 같이 함수처럼 호출하여 사용합니다.
@@ -76,47 +70,18 @@ public struct Inject<Key: DependencyKey>: Sendable {
             guard let resolver = await Weaver.current else {
                 throw WeaverError.containerNotFound
             }
-            return try await getOrResolveValue(from: resolver)
+            return try await resolver.resolve(keyType)
         } catch {
             let errorMessage = "의존성 해결 실패: \(Key.self). 기본값을 반환합니다. 에러: \(error.localizedDescription)"
             Task { await Weaver.current?.logger?.log(message: errorMessage, level: .debug) }
             return Key.defaultValue
         }
     }
-
-    /// 지정된 `Resolver`로부터 의존성을 해결하고 그 결과를 캐시하는 핵심 로직입니다.
-    private func getOrResolveValue(from resolver: any Resolver) async throws -> Key.Value {
-        // 1. 이미 해결된 값이 있다면 즉시 반환합니다.
-        if let cachedResult = await storage.getResult() {
-            return try cachedResult.get()
-        }
-        
-        // 2. 해결된 값이 없다면 컨테이너를 통해 새로 해결합니다.
-        let newResult: Result<Key.Value, Error>
-        do {
-            let value = try await resolver.resolve(keyType)
-            newResult = .success(value)
-        } catch {
-            newResult = .failure(error)
-        }
-        
-        // 3. 새로 해결된 결과를 저장소에 기록하고 반환합니다.
-        await storage.setResult(newResult)
-        return try newResult.get()
-    }
-
-    /// 의존성 해결 결과를 저장하는 스레드 안전한 내부 액터입니다.
-    fileprivate actor ValueStorage<Value: Sendable> {
-        private var resolutionResult: Result<Value, Error>?
-        func getResult() -> Result<Value, Error>? { resolutionResult }
-        func setResult(_ newResult: Result<Value, Error>) { resolutionResult = newResult }
-    }
 }
 
 /// `@Inject`의 `projectedValue`(`$myService`)를 통해 제공되는 기능을 담는 구조체입니다.
 public struct InjectProjection<Key: DependencyKey>: Sendable {
     fileprivate let keyType: Key.Type
-    fileprivate let storage: Inject<Key>.ValueStorage<Key.Value>
 
     /// 의존성을 해결하고, 실패 시 에러를 발생시킵니다.
     /// 전역 `Weaver.current` 컨테이너를 통해 의존성을 해결합니다.
@@ -125,30 +90,13 @@ public struct InjectProjection<Key: DependencyKey>: Sendable {
             guard let resolver = await Weaver.current else {
                 throw WeaverError.containerNotFound
             }
-            return try await getOrResolveValue(from: resolver)
+            return try await resolver.resolve(keyType)
         }
     }
     
     /// 지정된 `Resolver`로부터 의존성을 해결합니다.
     /// 테스트 또는 특정 스코프의 `Resolver`를 명시적으로 사용하고 싶을 때 유용합니다.
     public func from(_ resolver: any Resolver) async throws -> Key.Value {
-        try await getOrResolveValue(from: resolver)
-    }
-
-    private func getOrResolveValue(from resolver: any Resolver) async throws -> Key.Value {
-        if let cachedResult = await storage.getResult() {
-            return try cachedResult.get()
-        }
-        
-        let newResult: Result<Key.Value, Error>
-        do {
-            let value = try await resolver.resolve(keyType)
-            newResult = .success(value)
-        } catch {
-            newResult = .failure(error)
-        }
-        
-        await storage.setResult(newResult)
-        return try newResult.get()
+        try await resolver.resolve(keyType)
     }
 }

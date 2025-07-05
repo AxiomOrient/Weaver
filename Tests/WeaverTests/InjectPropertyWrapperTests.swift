@@ -33,6 +33,7 @@ struct InjectPropertyWrapperTests {
         // Arrange
         let factoryCallCounter = FactoryCallCounter()
         let container = await WeaverContainer.builder()
+            .enableAdvancedCaching() // Use the real cache manager
             .register(ServiceProtocolKey.self, scope: .cached) { _ in
                 TestService { await factoryCallCounter.increment() }
             }

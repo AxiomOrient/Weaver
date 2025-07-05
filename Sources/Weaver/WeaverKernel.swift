@@ -73,29 +73,23 @@ public actor DefaultWeaverKernel: WeaverKernel {
     // MARK: - Private Build Logic
 
     private func performBuild() async {
-        do {
-            stateContinuation.yield(.configuring)
-            
-            // 1. 빌더를 생성하고 모듈을 등록합니다.
-            let builder = WeaverContainer.builder()
-            for module in modules {
-                await module.configure(builder)
-            }
-            
-            // 2. 컨테이너를 빌드합니다.
-            //    `warmUp` 진행 상태를 콜백으로 받아 스트림에 전달합니다.
-            let builtContainer = await builder.build { progress in
-                self.stateContinuation.yield(.warmingUp(progress: progress))
-            }
-            
-            self.container = builtContainer
-            
-            // 3. 모든 준비가 완료되면 `.ready` 상태를 발행합니다.
-            stateContinuation.yield(.ready(builtContainer))
-            
-        } catch {
-            // 4. 빌드 과정에서 에러 발생 시 `.failed` 상태를 발행합니다.
-            stateContinuation.yield(.failed(error))
+        stateContinuation.yield(.configuring)
+        
+        // 1. 빌더를 생성하고 모듈을 등록합니다.
+        let builder = WeaverContainer.builder()
+        for module in modules {
+            await module.configure(builder)
         }
+        
+        // 2. 컨테이너를 빌드합니다.
+        //    `warmUp` 진행 상태를 콜백으로 받아 스트림에 전달합니다.
+        let builtContainer = await builder.build { progress in
+            self.stateContinuation.yield(.warmingUp(progress: progress))
+        }
+        
+        self.container = builtContainer
+        
+        // 3. 모든 준비가 완료되면 `.ready` 상태를 발행합니다.
+        stateContinuation.yield(.ready(builtContainer))
     }
 }

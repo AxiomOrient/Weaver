@@ -8,11 +8,6 @@ import os
 /// 고급 캐시 및 메트릭 기능을 활성화하기 위해 `WeaverBuilder`를 확장합니다.
 extension WeaverBuilder {
     /// 고급 캐시 시스템을 활성화합니다.
-    ///
-    /// 이 메서드를 호출하면, 컨테이너는 TTL, LRU/FIFO 퇴출 정책 등을 지원하는
-    /// `DefaultCacheManager`를 사용하게 됩니다.
-    /// - Parameter policy: 캐시의 최대 크기, TTL, 퇴출 정책 등을 담은 객체입니다. 기본값은 `.default`.
-    /// - Returns: 체이닝을 위해 빌더 자신(`Self`)을 반환합니다.
     @discardableResult
     public func enableAdvancedCaching(policy: CachePolicy = .default) -> Self {
         self.configuration.cachePolicy = policy
@@ -22,10 +17,6 @@ extension WeaverBuilder {
     }
     
     /// 메트릭 수집 기능을 활성화합니다.
-    ///
-    /// 이 메서드를 호출하면, 컨테이너는 의존성 해결 시간, 캐시 히트율 등의
-    /// 상세 정보를 수집하는 `DefaultMetricsCollector`를 사용하게 됩니다.
-    /// - Returns: 체이닝을 위해 빌더 자신(`Self`)을 반환합니다.
     @discardableResult
     public func enableMetricsCollection() -> Self {
         return setMetricsCollectorFactory {
@@ -40,8 +31,6 @@ extension WeaverBuilder {
 /// 의존성 그래프 기능을 활성화하기 위해 `WeaverContainer`를 확장합니다.
 extension WeaverContainer {
     /// 등록된 의존성 정보를 바탕으로 시각화할 수 있는 그래프 객체를 반환합니다.
-    ///
-    /// 이 기능은 디버깅 목적으로 의존성 관계를 파악하는 데 유용합니다.
     public func getDependencyGraph() -> DependencyGraph {
         return DependencyGraph(registrations: registrations)
     }
@@ -64,41 +53,34 @@ public struct DependencyGraph: Sendable {
         dot += "  node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\", penwidth=1.5];\n"
         dot += "  edge [fontname=\"Helvetica\", fontsize=10, arrowsize=0.8];\n\n"
 
-        // 1. 노드(의존성) 정의
-        dot += "  // Node Definitions\n"
-        registrations.values.forEach { registration in
-            let keyName = registration.keyName
-            let nodeName = keyName.split(separator: ".").last.map(String.init) ?? keyName
-            
-            let color: String = switch registration.scope {
-            case .container: "lightgreen"
-            case .cached: "khaki"
-            case .eagerContainer: "lightblue"
-            case .weak:
-                "lightred"
-            }
-            
-            dot += "  \"\(nodeName)\" [label=\"\(nodeName)\\n<\(registration.scope.rawValue)>\"; fillcolor=\(color)];\n"
-        }
-        dot += "\n"
-
-        // 2. 엣지(의존 관계) 정의
-        dot += "  // Edge Definitions\n"
+        // ✨ [로직 개선] 1. 조회용 맵 생성
+        // 프로퍼티 이름(소문자)을 실제 노드 이름(Key 타입 이름)에 매핑합니다.
+        // 예: "circulara" -> "CircularAKey"
+        // 이 맵을 통해 `_serviceAKey` 같은 문자열에서 실제 대상 노드를 찾을 수 있습니다.
         registrations.values.forEach { registration in
             let sourceNodeName = registration.keyName.split(separator: ".").last.map(String.init) ?? registration.keyName
             
-            // 등록 정보에 저장된 의존성 목록을 순회합니다.
-            registration.dependencies.forEach { dependencyKeyName in
-                // 의존성 키 이름(예: `_loggerKey`)을 사용하여 대상 노드 이름(예: `logger`)을 찾습니다.
-                // 매크로 규칙: `_` + `name` + `Key`
-                if dependencyKeyName.hasPrefix("_") && dependencyKeyName.hasSuffix("Key") {
-                    let targetNodeName = String(dependencyKeyName.dropFirst().dropLast(3))
+            registration.dependencies.forEach { dependencyDeclaration in
+                if let dependencyRegistration = registrations.first(where: { $0.value.keyName == dependencyDeclaration }) {
+                    let targetNodeName = dependencyRegistration.value.keyName.split(separator: ".").last.map(String.init) ?? dependencyRegistration.value.keyName
                     dot += "  \"\(sourceNodeName)\" -> \"\(targetNodeName)\";\n"
+                } else {
+                    print("Weaver Graph Warning: Could not find a matching node for dependency '\(dependencyDeclaration)' in '\(registration.keyName)'.")
                 }
             }
         }
         dot += "}"
         return dot
+    }
+}
+
+// MARK: - Private String Helper
+
+/// 하위 버전 호환성을 위해 `removingsuffix` 대신 사용할 헬퍼 확장입니다.
+private extension String {
+    func strippingSuffix(_ suffix: String) -> String? {
+        guard self.hasSuffix(suffix) else { return nil }
+        return String(self.dropLast(suffix.count))
     }
 }
 
@@ -327,7 +309,8 @@ actor DefaultMetricsCollector: MetricsCollecting {
             cacheHits: cacheHits,
             cacheMisses: cacheMisses,
             averageResolutionTime: totalResolutions > 0 ? totalDuration / Double(totalResolutions) : 0,
-            failedResolutions: failedResolutions
+            failedResolutions: failedResolutions,
+            weakReferences: WeakReferenceMetrics(totalWeakReferences: 0, aliveWeakReferences: 0, deallocatedWeakReferences: 0)
         )
     }
 }

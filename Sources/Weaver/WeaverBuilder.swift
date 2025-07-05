@@ -23,6 +23,7 @@ public actor WeaverBuilder {
     // MARK: - Configuration
     
     /// 의존성을 컨테이너에 등록합니다.
+    /// - Note: `.weak` 스코프는 타입 안정성을 위해 `registerWeak` 메서드를 사용해야 합니다.
     @discardableResult
     public func register<Key: DependencyKey>(
         _ keyType: Key.Type,
@@ -30,12 +31,44 @@ public actor WeaverBuilder {
         dependencies: [String] = [],
         factory: @escaping @Sendable (Resolver) async throws -> Key.Value
     ) -> Self {
+        // `.weak` 스코프 사용을 막아 안전한 `registerWeak` 메서드로 유도합니다.
+        precondition(scope != .weak, "For .weak scope, please use the type-safe 'registerWeak()' method.")
+
         let key = AnyDependencyKey(keyType)
         if registrations[key] != nil {
             Task { await logger.log(message: "경고: '\(key.description)' 키에 대한 의존성이 중복 등록되어 기존 내용을 덮어씁니다.", level: .debug) }
         }
         registrations[key] = DependencyRegistration(
             scope: scope,
+            factory: { resolver in try await factory(resolver) },
+            keyName: String(describing: keyType),
+            dependencies: dependencies
+        )
+        return self
+    }
+
+    /// 약한 참조(weak reference) 스코프 의존성을 등록합니다.
+    ///
+    /// 이 메서드는 제네릭 제약(`Key.Value: AnyObject`)을 통해 오직 클래스 타입의 의존성만 등록할 수 있도록
+    /// 컴파일 시점에 보장하여, 런타임 오류 가능성을 원천적으로 차단합니다.
+    ///
+    /// - Parameters:
+    ///   - keyType: 등록할 의존성의 `DependencyKey` 타입. `Value`는 반드시 클래스여야 합니다.
+    ///   - dependencies: 의존성 그래프 분석을 위한 의존성 이름 목록.
+    ///   - factory: 의존성 인스턴스를 생성하는 클로저.
+    /// - Returns: 체이닝을 위해 빌더 자신(`Self`)을 반환합니다.
+    @discardableResult
+    public func registerWeak<Key: DependencyKey>(
+        _ keyType: Key.Type,
+        dependencies: [String] = [],
+        factory: @escaping @Sendable (Resolver) async throws -> Key.Value
+    ) -> Self where Key.Value: AnyObject { // ✨ 컴파일 타임에 클래스 타입 제약 강제
+        let key = AnyDependencyKey(keyType)
+        if registrations[key] != nil {
+            Task { await logger.log(message: "경고: '\(key.description)' 키에 대한 의존성이 중복 등록되어 기존 내용을 덮어씁니다.", level: .debug) }
+        }
+        registrations[key] = DependencyRegistration(
+            scope: .weak, // 스코프를 .weak로 고정
             factory: { resolver in try await factory(resolver) },
             keyName: String(describing: keyType),
             dependencies: dependencies
