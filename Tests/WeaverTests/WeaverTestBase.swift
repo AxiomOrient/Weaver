@@ -9,18 +9,36 @@ enum TestError: Error, Sendable {
     case factoryFailed
 }
 
+/// 팩토리 호출 횟수를 동시성 환경에서 안전하게 추적하기 위한 액터
+actor FactoryCallCounter {
+    var count = 0
+    func increment() {
+        count += 1
+    }
+}
+
 /// 비동기 테스트에서 특정 작업의 완료를 기다리기 위한 동기화 유틸리티입니다.
 actor TestSignal {
     private var continuation: CheckedContinuation<Void, Never>?
-    
-    /// 대기 중인 `wait()`를 깨우고 다음 작업을 진행하도록 신호를 보냅니다.
+    private var isSignaled = false
+
+    /// `wait()`가 호출될 때까지 대기 중인 작업을 깨웁니다.
+    /// 만약 `wait()`가 아직 호출되지 않았다면, 신호가 왔음을 기록하여 `wait()`가 즉시 반환되도록 합니다.
     func signal() {
-        continuation?.resume()
-        continuation = nil
+        if let continuation {
+            continuation.resume()
+            self.continuation = nil
+        } else {
+            isSignaled = true
+        }
     }
-    
+
     /// `signal()`이 호출될 때까지 비동기적으로 대기합니다.
     func wait() async {
+        if isSignaled {
+            isSignaled = false
+            return
+        }
         await withCheckedContinuation { self.continuation = $0 }
     }
 }
@@ -38,8 +56,10 @@ final class TestService: Service, Sendable {
     let id = UUID()
     
     /// 인스턴스 생성 시 호출될 콜백. 팩토리 호출 횟수 추적에 사용됩니다.
-    init(onInit: (@Sendable () -> Void)? = nil) {
-        onInit?()
+    init(onInit: (@Sendable () async -> Void)? = nil) {
+        Task {
+            await onInit?()
+        }
     }
 }
 
@@ -56,15 +76,15 @@ final class NullService: Service, Sendable {
 /// `Disposable` 프로토콜을 준수하는 테스트 서비스입니다.
 final class DisposableService: Service, Disposable, Sendable {
     let id = UUID()
-    private let onDispose: @Sendable () -> Void
-    
-    init(onDispose: @escaping @Sendable () -> Void) {
+    private let onDispose: @Sendable () async -> Void
+
+    init(onDispose: @escaping @Sendable () async -> Void) {
         self.onDispose = onDispose
     }
-    
+
     /// 컨테이너 `shutdown` 시 `onDispose` 클로저를 호출합니다.
     func dispose() async {
-        onDispose()
+        await onDispose()
     }
 }
 

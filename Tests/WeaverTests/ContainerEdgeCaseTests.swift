@@ -45,6 +45,29 @@ struct ContainerEdgeCaseTests {
         #expect(isOverriddenInstance, "자식 컨테이너에서 resolve 시, 자식에 등록된 의존성이 우선적으로 반환되어야 합니다.")
     }
 
+    @Test("T3.3: 다단계 계층 - 손자 컨테이너가 조부모 의존성 참조")
+    func test_multiLevelHierarchy_whenResolvingFromGrandchild_shouldFindGrandparentDependency() async throws {
+        // Arrange
+        let grandparent = await WeaverContainer.builder()
+            .register(ServiceKey.self, scope: .container) { _ in TestService() }
+            .build()
+        
+        let parent = await WeaverContainer.builder()
+            .withParent(grandparent)
+            .build()
+
+        let child = await WeaverContainer.builder()
+            .withParent(parent)
+            .build()
+
+        // Act
+        let instanceFromGrandparent = try await grandparent.resolve(ServiceKey.self)
+        let instanceFromChild = try await child.resolve(ServiceKey.self)
+
+        // Assert
+        #expect(instanceFromChild.id == instanceFromGrandparent.id, "손자 컨테이너는 조부모 컨테이너에 등록된 의존성을 해결할 수 있어야 합니다.")
+    }
+
     // MARK: - 4. Error Handling & Edge Cases
 
     @Test("T4.1: 순환 참조")
@@ -82,7 +105,7 @@ struct ContainerEdgeCaseTests {
         }
     }
 
-    @Test("T4.4: 종료된 컨테이너 접근")
+    @Test("T4.3: 종료된 컨테이너 접근")
     func test_errorHandling_whenResolvingFromShutdownContainer_shouldThrowError() async {
         // Arrange
         let container = await WeaverContainer.builder()
@@ -94,6 +117,45 @@ struct ContainerEdgeCaseTests {
         // Act & Assert
         await #expect(throws: WeaverError.self, "종료된 컨테이너에 접근하면 .shutdownInProgress 오류를 포함한 WeaverError를 던져야 합니다.") {
             _ = try await container.resolve(ServiceKey.self)
+        }
+    }
+
+    @Test("T4.4: 계층 간 순환 참조로 인한 데드락")
+    func test_errorHandling_whenCircularDependencyBetweenHierarchicalContainers_shouldThrowError() async {
+        // Arrange
+        // 1. 부모와 자식 컨테이너를 먼저 빌드합니다.
+        let initialParentContainer = await WeaverContainer.builder().build()
+        let initialChildContainer = await WeaverContainer.builder()
+            .withParent(initialParentContainer)
+            .build()
+
+        // 2. 순환 참조를 포함하는 새로운 빌더를 생성합니다.
+        // 이 빌더들은 이미 빌드된 initialParentContainer와 initialChildContainer를 참조합니다.
+        let parentBuilderWithCircularDep = WeaverContainer.builder()
+        let childBuilderWithCircularDep = WeaverContainer.builder()
+
+        // Register CircularAKey in childBuilderWithCircularDep
+        // CircularA will try to resolve CircularB from initialParentContainer
+        await childBuilderWithCircularDep.register(CircularAKey.self, scope: .container) { resolver in
+            let serviceB = try await initialParentContainer.resolve(CircularBKey.self)
+            return CircularServiceA(serviceB: serviceB)
+        }
+
+        // Register CircularBKey in parentBuilderWithCircularDep
+        // CircularB will try to resolve CircularA from initialChildContainer
+        await parentBuilderWithCircularDep.register(CircularBKey.self, scope: .container) { resolver in
+            let serviceA = try await initialChildContainer.resolve(CircularAKey.self)
+            return CircularServiceB(serviceA: serviceA)
+        }
+
+        // 3. 순환 참조가 등록된 새로운 컨테이너를 빌드합니다.
+        // 이 컨테이너들은 기존 컨테이너를 부모로 가집니다.
+        let finalParentContainer = await parentBuilderWithCircularDep.build()
+        let finalChildContainer = await childBuilderWithCircularDep.withParent(finalParentContainer).build()
+
+        // Act & Assert
+        await #expect(throws: WeaverError.self, "계층 간 순환 참조가 감지되면 데드락 대신 오류를 던져야 합니다.") {
+            _ = try await finalChildContainer.resolve(CircularAKey.self)
         }
     }
 }
