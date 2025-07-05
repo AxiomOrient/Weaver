@@ -61,18 +61,22 @@ public struct Inject<Key: DependencyKey>: Sendable {
         self
     }
 
-    /// `$` 접두사를 통해 접근하는 projectedValue는 에러를 던지는(throwing) API 등 대체 기능을 제공합니다.
+    /// `$myService`와 같이 ` 접두사를 통해 접근하는 projectedValue는 에러를 던지는(throwing) API 등 대체 기능을 제공합니다.
     public var projectedValue: InjectProjection<Key> {
-        InjectProjection(getOrResolveValue: { @Sendable in
-            try await self.getOrResolveValue()
-        })
+        InjectProjection(
+            keyType: keyType,
+            storage: storage
+        )
     }
 
     /// 기본 의존성 접근 방식입니다. `await myService()`와 같이 함수처럼 호출하여 사용합니다.
-    /// 의존성 해결에 실패할 경우 `Key.defaultValue`를 반환하고, 디버깅을 위해 로그를 남깁니다.
+    /// 전역 `Weaver.current` 컨테이너를 통해 의존성을 해결하며, 실패 시 `Key.defaultValue`를 반환합니다.
     public func callAsFunction() async -> Key.Value {
         do {
-            return try await getOrResolveValue()
+            guard let resolver = await Weaver.current else {
+                throw WeaverError.containerNotFound
+            }
+            return try await getOrResolveValue(from: resolver)
         } catch {
             let errorMessage = "의존성 해결 실패: \(Key.self). 기본값을 반환합니다. 에러: \(error.localizedDescription)"
             Task { await Weaver.current?.logger?.log(message: errorMessage, level: .debug) }
@@ -80,8 +84,8 @@ public struct Inject<Key: DependencyKey>: Sendable {
         }
     }
 
-    /// 내부적으로 의존성을 해결하고 그 결과를 캐시하는 핵심 로직입니다.
-    private func getOrResolveValue() async throws -> Key.Value {
+    /// 지정된 `Resolver`로부터 의존성을 해결하고 그 결과를 캐시하는 핵심 로직입니다.
+    private func getOrResolveValue(from resolver: any Resolver) async throws -> Key.Value {
         // 1. 이미 해결된 값이 있다면 즉시 반환합니다.
         if let cachedResult = await storage.getResult() {
             return try cachedResult.get()
@@ -90,10 +94,7 @@ public struct Inject<Key: DependencyKey>: Sendable {
         // 2. 해결된 값이 없다면 컨테이너를 통해 새로 해결합니다.
         let newResult: Result<Key.Value, Error>
         do {
-            guard let container = await Weaver.current else {
-                throw WeaverError.containerNotFound
-            }
-            let value = try await container.resolve(keyType)
+            let value = try await resolver.resolve(keyType)
             newResult = .success(value)
         } catch {
             newResult = .failure(error)
@@ -105,22 +106,49 @@ public struct Inject<Key: DependencyKey>: Sendable {
     }
 
     /// 의존성 해결 결과를 저장하는 스레드 안전한 내부 액터입니다.
-    private actor ValueStorage<Value: Sendable> {
+    fileprivate actor ValueStorage<Value: Sendable> {
         private var resolutionResult: Result<Value, Error>?
         func getResult() -> Result<Value, Error>? { resolutionResult }
         func setResult(_ newResult: Result<Value, Error>) { resolutionResult = newResult }
     }
 }
 
-/// `@Inject`의 `projectedValue`(`$`)를 통해 제공되는 기능을 담는 구조체입니다.
+/// `@Inject`의 `projectedValue`(`$myService`)를 통해 제공되는 기능을 담는 구조체입니다.
 public struct InjectProjection<Key: DependencyKey>: Sendable {
-    fileprivate let getOrResolveValue: @Sendable () async throws -> Key.Value
+    fileprivate let keyType: Key.Type
+    fileprivate let storage: Inject<Key>.ValueStorage<Key.Value>
 
     /// 의존성을 해결하고, 실패 시 에러를 발생시킵니다.
-    /// 컨테이너가 준비되지 않았거나 의존성 해결에 실패했을 때 명시적으로 에러를 처리하고 싶을 때 사용합니다.
+    /// 전역 `Weaver.current` 컨테이너를 통해 의존성을 해결합니다.
     public var resolved: Key.Value {
         get async throws {
-            try await getOrResolveValue()
+            guard let resolver = await Weaver.current else {
+                throw WeaverError.containerNotFound
+            }
+            return try await getOrResolveValue(from: resolver)
         }
+    }
+    
+    /// 지정된 `Resolver`로부터 의존성을 해결합니다.
+    /// 테스트 또는 특정 스코프의 `Resolver`를 명시적으로 사용하고 싶을 때 유용합니다.
+    public func from(_ resolver: any Resolver) async throws -> Key.Value {
+        try await getOrResolveValue(from: resolver)
+    }
+
+    private func getOrResolveValue(from resolver: any Resolver) async throws -> Key.Value {
+        if let cachedResult = await storage.getResult() {
+            return try cachedResult.get()
+        }
+        
+        let newResult: Result<Key.Value, Error>
+        do {
+            let value = try await resolver.resolve(keyType)
+            newResult = .success(value)
+        } catch {
+            newResult = .failure(error)
+        }
+        
+        await storage.setResult(newResult)
+        return try newResult.get()
     }
 }

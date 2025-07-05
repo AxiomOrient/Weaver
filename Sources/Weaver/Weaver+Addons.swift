@@ -74,6 +74,8 @@ public struct DependencyGraph: Sendable {
             case .container: "lightgreen"
             case .cached: "khaki"
             case .eagerContainer: "lightblue"
+            case .weak:
+                "lightred"
             }
             
             dot += "  \"\(nodeName)\" [label=\"\(nodeName)\\n<\(registration.scope.rawValue)>\"; fillcolor=\(color)];\n"

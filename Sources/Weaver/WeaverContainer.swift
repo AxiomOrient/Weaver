@@ -183,7 +183,7 @@ public actor WeaverContainer: Resolver {
         
         do {
             switch registration.scope {
-            case .container, .eagerContainer:
+            case .container, .eagerContainer, .weak:
                 return try await getOrCreateContainerInstance(key: key, registration: registration)
             case .cached:
                 let (task, isHit) = await cacheManager.taskForInstance(key: key) { try await registration.factory(self) }
@@ -200,13 +200,34 @@ public actor WeaverContainer: Resolver {
     // MARK: - Container Scope Helpers
     
     private func getOrCreateContainerInstance(key: AnyDependencyKey, registration: DependencyRegistration) async throws -> any Sendable {
-        if let instance = containerCache[key] {
-            return instance
+        // 1. 캐시 확인
+        if let cachedValue = containerCache[key] {
+            if registration.scope == .weak {
+                if let weakBox = cachedValue as? WeakBox, let value = weakBox.value {
+                    // `value`는 AnyObject 타입이므로, `any Sendable`로 안전하게 캐스팅하여 반환합니다.
+                    // 이 캐스팅은 `createAndCacheInstance`에서 Sendable을 보장하므로 항상 성공해야 합니다.
+                    guard let sendableValue = value as? any Sendable else {
+                        throw WeaverError.resolutionFailed(.typeMismatch(expected: "any Sendable", actual: "\(type(of: value))", keyName: key.description))
+                    }
+                    return sendableValue
+                }
+                // 약한 참조가 해제되었다면 캐시에서 제거하고 아래 생성 로직으로 넘어갑니다.
+                containerCache.removeValue(forKey: key)
+            } else {
+                return cachedValue
+            }
         }
+
+        // 2. 진행 중인 생성 작업 확인
         if let task = ongoingCreations[key] {
             return try await task.value
         }
         
+        // 3. 인스턴스 생성 및 캐시
+        return try await createAndCacheInstance(key: key, registration: registration)
+    }
+    
+    private func createAndCacheInstance(key: AnyDependencyKey, registration: DependencyRegistration) async throws -> any Sendable {
         let newTask = Task {
             try await registration.factory(self)
         }
@@ -215,7 +236,17 @@ public actor WeaverContainer: Resolver {
         
         do {
             let instance = try await newTask.value
-            containerCache[key] = instance
+            
+            if registration.scope == .weak {
+                // .weak 스코프는 클래스 타입(AnyObject)이어야 약한 참조가 가능합니다.
+                guard let object = instance as? AnyObject else {
+                    throw WeaverError.resolutionFailed(.typeMismatch(expected: "AnyObject (class type)", actual: "\(type(of: instance))", keyName: key.description))
+                }
+                containerCache[key] = WeakBox(object)
+            } else {
+                containerCache[key] = instance
+            }
+            
             ongoingCreations.removeValue(forKey: key)
             if let disposable = instance as? Disposable {
                 await disposableManager.add(disposable)
@@ -229,6 +260,14 @@ public actor WeaverContainer: Resolver {
 }
 
 // MARK: - ==================== Internal Helpers ====================
+
+/// 약한 참조(weak reference)를 저장하기 위한 래퍼 클래스입니다.
+private final class WeakBox: @unchecked Sendable {
+    weak var value: AnyObject?
+    init(_ value: AnyObject) {
+        self.value = value
+    }
+}
 
 /// `.container` 스코프이면서 `Disposable`을 채택한 인스턴스들의 생명주기를 관리하는 액터입니다.
 internal actor DisposableManager {
@@ -271,10 +310,15 @@ private final class AtomicInt: @unchecked Sendable {
 
 /// 의존성의 생명주기를 정의하는 스코프 타입입니다.
 public enum Scope: String, Sendable {
+    /// 컨테이너와 생명주기를 함께하는 가장 일반적인 스코프입니다.
     case container
+    /// 고급 캐시 정책(TTL, LRU)에 따라 관리되는 스코프입니다.
     case cached
-    /// ✅ IMPROVE: 컨테이너 빌드 시점에 즉시 초기화되는 스코프입니다.
+    /// 컨테이너 빌드 시점에 즉시 초기화되는 스코프입니다.
     case eagerContainer
+    /// 의존성을 약한 참조(weak reference)로 관리하는 스코프입니다.
+    /// 순환 참조 방지나 메모리에 민감한 객체에 유용합니다.
+    case weak
 }
 
 
@@ -350,13 +394,15 @@ public enum ResolutionError: Error, LocalizedError, Sendable {
     case factoryFailed(keyName: String, underlying: any Error & Sendable)
     case typeMismatch(expected: String, actual: String, keyName: String)
     case keyNotFound(keyName: String)
+    case weakObjectDeallocated(keyName: String)
     
     public var errorDescription: String? {
         switch self {
         case .circularDependency(let path): return "순환 참조가 감지되었습니다: \(path)"
         case .factoryFailed(let keyName, let underlying): return "'\(keyName)' 의존성 생성(factory)에 실패했습니다: \(underlying.localizedDescription)"
-        case .typeMismatch(let expected, let actual, let keyName): return "'\(keyName)' 의존성의 타입이 일치하지 않습니다. 예상: \(expected), 실제: \(actual)"
+        case .typeMismatch(let expected, let actual, let keyName): return "'\(keyName)' 의존성의 타입이 일치하지 않습니다. 예상: \(expected), 실제: \(actual). '.weak' 스코프는 클래스(AnyObject) 타입만 지원합니다."
         case .keyNotFound(let keyName): return "'\(keyName)' 키에 대한 등록 정보를 찾을 수 없습니다."
+        case .weakObjectDeallocated(let keyName): return "'\(keyName)'에 대한 약한 참조(weak) 의존성이 이미 메모리에서 해제되었습니다."
         }
     }
 }
