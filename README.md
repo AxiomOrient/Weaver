@@ -1,322 +1,220 @@
 # Weaver 🕸️
 
-**A Modern, Type-Safe, and Concurrency-Focused Dependency Injection Container for Swift.**
+[](https://swift.org)
+[](https://developer.apple.com/swift/)
+[](https://opensource.org/licenses/MIT)
 
-[![Swift Version](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://www.swift.org)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20iOS%20%7C%20watchOS%20%7C%20tvOS-lightgrey.svg)](https://www.swift.org)
-[![Swift Package Manager](https://img.shields.io/badge/Swift_Package_Manager-compatible-brightgreen.svg)](https://swift.org/package-manager/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+**Weaver**는 Swift 6의 현대적인 동시성 모델(`async/await`, `actor`)을 기반으로 설계된, **타입-세이프(Type-Safe)하고 강력한 의존성 주입(Dependency Injection) 라이브러리**입니다. 데이터 경쟁(Data Race)으로부터 원천적으로 안전하며, 비동기 환경, 특히 **SwiftUI**에 완벽하게 통합됩니다.
 
-Weaver is a next-generation Dependency Injection container for Swift, meticulously crafted for the modern era of concurrent programming. Built from the ground up with Swift 6's strict concurrency model in mind, its `actor`-based core guarantees thread safety out of the box. Weaver isn't just about managing dependencies; it's about building robust, scalable, and maintainable applications with confidence and clarity.
+## ✨ 주요 특징
 
----
+  - **동시성 안전 설계 (Concurrency Safety)**: 핵심 컴포넌트인 `WeaverContainer`가 `actor`로 구현되어, 복잡한 락(lock) 없이도 스레드로부터 안전한 의존성 관리 및 해결을 보장합니다.
+  - **선언적 API (Declarative API)**: `@Registrar` 및 `@Register` 매크로를 통해 보일러플레이트 없이 간결하고 직관적으로 의존성을 선언할 수 있습니다.
+  - **강력한 생명주기 관리 (Powerful Lifecycle Scopes)**:
+      - `.container`: 최초 요청 시 한 번만 생성되는 **Lazy Singleton** 스코프.
+      - `.cached`: TTL, 개수 제한, LRU/FIFO 퇴출 정책을 지원하는 **고급 캐시** 스코프.
+      - `.eagerContainer`: 앱 시작 시점에 즉시 생성되는 **Eager Singleton** 스코프로, 비동기 초기화 문제를 우아하게 해결합니다.
+  - **완벽한 SwiftUI 통합 (Seamless SwiftUI Integration)**:
+      - `WeaverHost` 및 `.weaver()` 수정자를 통해 SwiftUI 뷰 계층에 안전하게 의존성을 주입합니다.
+      - `@Environment(\.weaverResolver)`를 통해 뷰에서 의존성을 쉽게 해결할 수 있습니다.
+      - 플레이스홀더(Placeholder) 컨테이너를 통해 **SwiftUI Preview가 항상 정상적으로 동작**하도록 보장합니다.
+  - **의존성 그래프 시각화**: 등록된 의존성 간의 관계를 시각적으로 파악할 수 있는 **그래프 생성 기능**을 제공하여 디버깅 및 아키텍처 분석을 돕습니다.
 
-## Features
+-----
 
-- **Concurrency-First Architecture**: Built entirely with `actor`s, Weaver is inherently data-race safe and seamlessly integrates with the Swift Concurrency model. All APIs are fully `Sendable`.
-- **Modular by Design**: Organize dependencies into logical `Module`s that mirror your app's features, preventing the "massive dependency file" problem and improving maintainability.
-- **Type-Safe Resolution**: Leverage the Swift compiler to catch dependency errors at build time, not runtime. Say goodbye to unexpected `nil` values and type-casting errors.
-- **Elegant `@Inject` Wrapper**: Declare dependencies effortlessly with a clean and intuitive property wrapper. Your business logic remains pure and focused, free from boilerplate DI code.
-- **Powerful Scoping**: Fine-grained control over object lifecycles with `.container` (singleton), `.cached` (time- or policy-based) scopes.
-- **Hierarchical Containers**: Override dependencies with ease for testing, feature flagging, or different environments. Create child containers that inherit from and extend parent configurations.
-- **Insightful Tooling**: Analyze container performance with built-in metrics and visualize your architecture with auto-generated dependency graphs.
+## 🚀 시작하기: SwiftUI와 함께
 
----
+`Weaver`는 SwiftUI 앱에 의존성을 주입하는 현대적이고 간결한 방법을 제공합니다. 이 가이드에서는 \*\*"초기화에 5초가 걸리는 무거운 인증 서비스"\*\*를 앱 시작 시점에 안전하게 준비시키는 과정을 통해 `Weaver`의 핵심 기능을 살펴보겠습니다.
 
-## Installation
+### 1\. 서비스 정의 및 DependencyKey
 
-### Swift Package Manager
-
-Add `Weaver` to your project by including it in your `Package.swift` file's `dependencies` array.
-
-```swift
-.package(url: "https://github.com/AxiomOrient/Weaver.git", from: "0.0.2")
-```
-
-Then, add `"Weaver"` to your target's `dependencies`.
+먼저, 앱에서 사용할 서비스와 각 서비스를 고유하게 식별할 `DependencyKey`를 정의합니다.
 
 ```swift
-.target(
-    name: "MyApp",
-    dependencies: ["Weaver"]
-)
-```
+import Foundation
+import Weaver
 
----
+// --- 서비스 프로토콜 ---
 
-## Quick Start
-
-Getting started with Weaver involves three simple steps:
-
-### 1. Define a Service and its Key
-
-A `DependencyKey` is a unique, typed identifier for your service. It defines the contract (protocol) and provides a default implementation.
-
-```swift
-// --- Services/NetworkService.swift
-
-// Define the contract for your service
-protocol NetworkServicing: Sendable {
-    func fetchData() async -> String
+protocol LoggerService: Sendable {
+    func log(_ message: String)
 }
 
-// Provide a default implementation
-final class DefaultNetworkService: NetworkServicing {
-    func fetchData() async -> String { "Hello from the network!" }
+protocol AuthenticationService: Sendable {
+    var userID: String { get }
+    func login()
 }
 
-// Create a unique key to identify this service
-struct NetworkServiceKey: DependencyKey {
-    static var defaultValue: NetworkServicing = DefaultNetworkService()
+// --- 서비스 구현체 ---
+
+class ProductionLogger: LoggerService, @unchecked Sendable {
+    func log(_ message: String) { print("🪵 [Logger]: \(message)") }
 }
-```
 
-### 2. Build the Container
+// ⚠️ 초기화에 5초가 걸리는 무거운 서비스
+class FirebaseAuthService: AuthenticationService, @unchecked Sendable {
+    let userID: String
 
-The `WeaverContainer` holds your dependency registrations. Use the fluent builder API to register your services.
-
-```swift
-// --- App.swift
-
-let container = await WeaverContainer.builder()
-    .register(NetworkServiceKey.self, scope: .container) { _ in DefaultNetworkService() }
-    .build()
-```
-
-### 3. Set the Scope and Resolve
-
-Use `Weaver.withScope(_:operation:)` to make the container available to the current asynchronous task. Inside the scope, you can resolve your dependencies.
-
-```swift
-do {
-    // Make the container available for the current task
-    try await Weaver.withScope(container) {
-        // Resolve the service using its key
-        let networkService = try await container.resolve(NetworkServiceKey.self)
-        
-        let message = await networkService.fetchData()
-        print(message) // Prints: "Hello from the network!"
+    init(logger: LoggerService) {
+        logger.log("🔥 인증 서비스 초기화 시작... (5초 소요)")
+        Thread.sleep(forTimeInterval: 5) // 실제 앱에서는 비동기 네트워크 요청
+        self.userID = "user_12345"
+        logger.log("✅ 인증 서비스 초기화 완료!")
     }
-} catch {
-    print("Error resolving dependency: \(error.localizedDescription)")
+
+    func login() {
+        print("🎉 [Auth]: \(userID)님, 성공적으로 로그인되었습니다!")
+    }
 }
-```
 
----
+// --- DependencyKey 정의 ---
 
-## Advanced Example: A Modern Blog App
-
-Let's see how Weaver shines in a real-world scenario. We'll build a feature that fetches articles, which requires authentication and a network client.
-
-### 1. Define All Services and Keys
-
-First, we define the contracts (protocols) and unique keys for all our services.
-
-```swift
-// --- App/Services.swift
-
-// Protocols
-protocol Authenticating: Sendable { func currentUserID() -> String? }
-protocol APIFetching: Sendable { func fetch(url: URL) async throws -> Data }
-protocol ArticleRepositoring: Sendable { func fetchLatestArticles() async throws -> [String] }
-
-// Concrete Implementations (Sendable)
-final actor DefaultAuthService: Authenticating { /* ... */ }
-final actor URLSessionClient: APIFetching { /* ... */ }
-
-// --- App/DependencyKeys.swift
-
-struct AuthServiceKey: DependencyKey {
-    static var defaultValue: Authenticating = DefaultAuthService()
+struct LoggerServiceKey: DependencyKey {
+    static var defaultValue: any LoggerService { ProductionLogger() }
 }
-struct APIClientKey: DependencyKey {
-    static var defaultValue: APIFetching = URLSessionClient()
-}
-struct ArticleRepositoryKey: DependencyKey {
-    // For services with dependencies, the default can be a dummy/fatalError,
-    // as the real implementation will be provided in a module.
-    private struct Dummy: ArticleRepositoring { func fetchLatestArticles() async throws -> [String] {[]} }
-    static var defaultValue: ArticleRepositoring = Dummy()
-}
-```
 
-### 2. Implement Services with `@Inject`
-
-The `@Inject` property wrapper makes it trivial for your services to access their own dependencies. Weaver handles the resolution automatically.
-
-```swift
-// --- Features/Articles/ArticleRepository.swift
-
-final class DefaultArticleRepository: ArticleRepositoring, Sendable {
-    // Declare dependencies with @Inject. They will be resolved automatically.
-    @Inject(AuthServiceKey.self) private var authService
-    @Inject(APIClientKey.self) private var apiClient
-
-    func fetchLatestArticles() async throws -> [String] {
-        // Use the injected services with a simple, async function call.
-        guard let userID = await authService().currentUserID() else {
-            throw MyError.notAuthenticated
-        }
-        
-        let url = URL(string: "https://api.myblog.com/users/\(userID)/articles")!
-        let data = try await apiClient().fetch(url: url)
-        
-        // ... decode data into articles
-        return ["Swift Concurrency", "Modern DI with Weaver"]
+struct AuthenticationServiceKey: DependencyKey {
+    // 미리 준비되어야 하므로, 기본값은 fatalError로 설정
+    static var defaultValue: any AuthenticationService {
+        fatalError("AuthenticationService는 반드시 Eager-Loading 되어야 합니다.")
     }
 }
 ```
 
-### 3. Group Dependencies into a `Module`
+### 2\. Weaver 모듈 정의와 생명주기 선택
 
-Modules help organize your registration logic, keeping your dependency graph clean and maintainable as your app grows.
+`@Registrar` 매크로를 사용하여 의존성들을 그룹화하고, 각 서비스의 특성에 맞는 **스코프**를 지정합니다.
+
+  - **`@Register(scope: .container)`**: `LoggerService`처럼 가볍고, 필요할 때 만들어도 되는 서비스에 사용합니다.
+  - **`@Register(scope: .eagerContainer)`**: `AuthenticationService`처럼 무겁고 앱 시작에 필수적인 서비스에 사용합니다. 이것이 바로 `Weaver`의 비동기 초기화 문제 해결의 핵심입니다.
+
+<!-- end list -->
 
 ```swift
-// --- Features/Articles/ArticleFeatureModule.swift
+import Weaver
 
-struct ArticleFeatureModule: Module {
-    func configure(_ builder: WeaverBuilder) async {
-        builder
-            // Register the concrete implementation for the repository
-            .register(ArticleRepositoryKey.self, scope: .container) { _ in DefaultArticleRepository() }
-            
-            // Register its dependencies
-            .register(AuthServiceKey.self, scope: .container) { _ in DefaultAuthService() }
-            .register(APIClientKey.self, scope: .container) { _ in URLSessionClient() }
+@Registrar
+struct ServiceModule: Module {
+    // ✅ Logger는 가벼우므로, 필요할 때 생성 (.container)
+    @Register(scope: .container)
+    var logger: any LoggerService {
+        ProductionLogger()
+    }
+
+    // ✅ 인증 서비스는 무겁고 필수적이므로, 즉시 생성 (.eagerContainer)
+    @Register(scope: .eagerContainer)
+    func authenticationService(resolver: Resolver) async throws -> any AuthenticationService {
+        // 다른 서비스(logger)에 의존할 수 있습니다.
+        let logger = try await resolver.resolve(LoggerServiceKey.self)
+        return FirebaseAuthService(logger: logger)
     }
 }
 ```
 
-### 4. Assemble and Run the App
+### 3\. SwiftUI 뷰와 컨테이너 설정
 
-In your main application entry point, build the container using your modules and set it as the top-level scope.
+`WeaverHost`를 사용하여 앱의 최상위 뷰를 감싸고, 컨테이너 빌드가 완료될 때까지 보여줄 로딩 뷰를 설정합니다.
 
 ```swift
-// --- App/BlogApp.swift
+import SwiftUI
+import Weaver
 
 @main
-struct BlogApp {
-    static func main() async throws {
-        // Build the container by composing modules
-        let container = await WeaverContainer.builder()
-            .withModules([ArticleFeatureModule()])
-            .build()
-        
-        // Set the container for the app's main scope
-        try await Weaver.withScope(container) {
-            // Now, any service can be resolved from anywhere in the app.
-            let articleRepo = try await container.resolve(ArticleRepositoryKey.self)
-            let articles = try await articleRepo.fetchLatestArticles()
-            
-            print("Fetched Articles: \(articles)")
+struct MyApp: App {
+    var body: some Scene {
+        WindowGroup {
+            WeaverHost(
+                modules: [ServiceModule()],
+                loadingView: {
+                    VStack {
+                        ProgressView()
+                        Text("앱의 핵심 서비스를 준비 중입니다...")
+                    }
+                }
+            ) { resolver in // 빌드가 완료되면 실제 resolver가 전달됩니다.
+                ContentView()
+                    .environment(\.weaverResolver, resolver)
+            }
         }
     }
 }
 ```
 
----
+### 4\. 뷰에서 의존성 사용하기
 
-## In-Depth Features
-
-### `@Inject`: Safe vs. Strict Resolution
-
-The `@Inject` property wrapper offers two powerful ways to resolve dependencies, allowing you to choose the right behavior for every situation.
-
-#### 1. Safe Resolution: `service()`
-This is the default, recommended approach for most cases. It uses `callAsFunction` syntax. If the dependency fails to resolve for any reason, it logs the error and returns the `defaultValue` defined in your `DependencyKey`.
+이제 뷰에서는 `@Environment(\.weaverResolver)`를 통해 주입된 `resolver`를 사용하여, 필요할 때 언제든지 의존성 객체를 안전하게 가져올 수 있습니다.
 
 ```swift
-@Inject(MyServiceKey.self) private var service
+struct ContentView: View {
+    @Environment(\.weaverResolver) private var resolver
 
-func doSomething() async {
-    // Returns MyServiceKey.defaultValue if resolution fails. No `try` needed.
-    let result = await service().doWork() 
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Weaver 준비 완료!")
+                .font(.largeTitle.bold())
+
+            Button("로그인 실행") {
+                Task {
+                    // 이 시점에는 5초가 걸리는 인증 서비스가 이미 준비되어 있습니다.
+                    let auth = try await resolver.resolve(AuthenticationServiceKey.self)
+                    auth.login()
+                }
+            }
+        }
+    }
 }
 ```
-**Use Case**: Ideal for non-critical dependencies or UI components where showing a default state is better than crashing.
 
-#### 2. Strict Resolution: `try await $service.resolved`
-By using the projected value (`$service`), you can access the `resolved` property. This method will **throw a `WeaverError`** if the dependency cannot be resolved.
+### 실행 결과 🎬
+
+1.  **앱 시작 (0초)**: 화면에 "앱의 핵심 서비스를 준비 중입니다..."라는 로딩 뷰가 나타납니다.
+2.  **백그라운드 준비 (0초 \~ 5초)**: `Weaver`가 `.eagerContainer`로 등록된 `authenticationService`를 백그라운드에서 생성합니다.
+3.  **준비 완료 (5초 시점)**: 서비스 생성이 완료되면 로딩 뷰는 사라지고 `ContentView`가 나타납니다.
+4.  **사용자 인터랙션 (5초 이후)**: `로그인 실행` 버튼을 누르면, **아무런 딜레이 없이** 즉시 인증 서비스가 실행됩니다.
+
+이것이 바로 `Weaver`가 비동기 초기화 문제를 해결하는 우아한 방식입니다. **비싼 초기화 비용을 앱 시작 시 로딩 화면 뒤에서 모두 처리**하여, 사용자에게는 항상 완벽하게 준비된 상태의 앱을 제공합니다.
+
+-----
+
+## 🔬 고급 기능
+
+### 생명주기 스코프 (Lifecycle Scopes)
+
+`Weaver`는 세 가지의 강력한 스코프를 제공하여 의존성의 생명주기를 정교하게 관리할 수 있습니다.
+
+| 스코프 | 생성 시점 (Initialization) | 사용 사례 |
+| :--- | :--- | :--- |
+| **`.container`** | **Lazy**: 최초 `resolve()` 호출 시 | 일반적인 서비스, 가벼운 객체, 특정 화면에서만 사용되는 경우 |
+| **`.eagerContainer`** | **Eager**: `WeaverContainer` 빌드 시 | **핵심 서비스**, 비싼 초기화 비용, 앱 시작 시 반드시 준비되어야 하는 경우 |
+| **`.cached`** | **Lazy**: 최초 `resolve()` 호출 시 | TTL, 개수 제한 등 **고급 캐시 정책**이 필요한 경우 |
+
+### 의존성 그래프 디버깅
+
+복잡한 의존성 관계를 한눈에 파악하고 싶을 때, `getDependencyGraph()`를 사용할 수 있습니다.
 
 ```swift
-@Inject(MyCriticalServiceKey.self) private var criticalService
-
-func setup() async throws {
-    // Throws an error if resolution fails. The app will not proceed.
-    let service = try await $criticalService.resolved
-    await service.performCriticalTask()
-}
-```
-**Use Case**: Perfect for essential services like a database connection or authentication manager, where the application cannot function without a valid instance.
-
-### Hierarchical Containers for Testing
-
-Override dependencies for unit tests or different environments by creating a child container. The child inherits all registrations from the parent but can provide its own implementations for specific keys.
-
-```swift
-// 1. Main container uses the real network client
-let mainContainer = await WeaverContainer.builder()
-    .register(APIClientKey.self) { _ in RealNetworkClient() }
+let container = await WeaverContainer.builder()
+    .withModules([ServiceModule()])
     .build()
 
-// 2. Test container inherits from main but overrides the API client with a mock
-let testContainer = await WeaverContainer.builder()
-    .withParent(mainContainer)
-    .register(APIClientKey.self) { _ in MockNetworkClient(stub: .success(someData)) }
-    .build()
-
-// Now, resolving from the testContainer will return the mock object.
-// This is perfect for creating a controlled environment for your tests.
-try await Weaver.withScope(testContainer) {
-    let client = try await testContainer.resolve(APIClientKey.self)
-    #expect(client is MockNetworkClient)
-}
-```
-
-### Powerful Tooling
-
-Weaver provides built-in tools to help you understand and debug your dependency graph.
-
-#### Performance Metrics
-Analyze the performance of your container, including cache hit rates and average resolution times.
-
-```swift
-let metrics = await container.getMetrics()
-print(metrics)
-```
-**Example Output:**
-```
-Resolution Metrics:
-- Total Resolutions: 152
-- Success Rate: 99.3%
-- Failed Resolutions: 1
-- Cache Hit Rate: 85.0% (Hits: 85, Misses: 15)
-- Avg. Resolution Time: 0.0241ms
-```
-
-#### Dependency Graph
-Generate a DOT-formatted representation of your dependency graph to easily visualize your app's architecture.
-
-```swift
-let dotGraph = await container.generateDependencyGraph()
+// DOT 언어 형식의 그래프 문자열 생성
+let dotGraph = await container.getDependencyGraph().generateDotGraph()
 print(dotGraph)
 ```
-**Example Output (DOT Format):**
+
+생성된 문자열을 [Graphviz Online](https://dreampuf.github.io/GraphvizOnline/)과 같은 도구에 붙여넣으면, 아래와 같이 의존성 관계가 시각화된 다이어그램을 얻을 수 있습니다.
+
 ```dot
 digraph Dependencies {
-  rankdir=TB;
-  node [shape=box, style=rounded];
-  "AuthServiceKey" [fillcolor=lightgreen, style=filled];
-  "APIClientKey" [fillcolor=lightgreen, style=filled];
-  "ArticleRepositoryKey" [fillcolor=lightgreen, style=filled];
-  "ArticleRepositoryKey" -> "AuthServiceKey";
-  "ArticleRepositoryKey" -> "APIClientKey";
+  // ... 노드 및 엣지 정의 ...
+  "authenticationService" [label="authenticationService\n<eagerContainer>", fillcolor=lightblue];
+  "logger" [label="logger\n<container>", fillcolor=lightgreen];
+  "authenticationService" -> "logger";
 }
 ```
-> **Tip:** Paste this output into an online viewer like [Graphviz Online](https://dreampuf.github.io/GraphvizOnline/) to generate a visual diagram of your dependencies.
 
----
+이를 통해 어떤 서비스가 다른 서비스에 의존하는지, 각 서비스의 스코프는 무엇인지 명확하게 파악하여 아키텍처를 개선하고 문제를 디버깅하는 데 큰 도움을 받을 수 있습니다.
 
-## License
+## 📜 라이선스
 
-Weaver is released under the MIT license. See [LICENSE](LICENSE) for details.
+Weaver는 MIT 라이선스에 따라 제공됩니다.

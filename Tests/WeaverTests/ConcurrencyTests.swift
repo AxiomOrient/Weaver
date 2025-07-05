@@ -4,14 +4,6 @@ import Testing
 @Suite("5. 동시성 및 안정성 (Concurrency & Safety)")
 struct ConcurrencyTests {
 
-    /// 팩토리 호출 횟수를 동시성 환경에서 안전하게 추적하기 위한 액터
-    private actor FactoryCallCounter {
-        var count = 0
-        func increment() {
-            count += 1
-        }
-    }
-
     @Test("T5.1: 동일 의존성 동시 해결")
     func test_concurrency_whenResolvingSameDependency_shouldReturnSameInstanceAndCallFactoryOnce() async throws {
         // Arrange

@@ -9,6 +9,14 @@ enum TestError: Error, Sendable {
     case factoryFailed
 }
 
+/// 팩토리 호출 횟수를 동시성 환경에서 안전하게 추적하기 위한 액터
+actor FactoryCallCounter {
+    var count = 0
+    func increment() {
+        count += 1
+    }
+}
+
 /// 비동기 테스트에서 특정 작업의 완료를 기다리기 위한 동기화 유틸리티입니다.
 actor TestSignal {
     private var continuation: CheckedContinuation<Void, Never>?
@@ -48,8 +56,10 @@ final class TestService: Service, Sendable {
     let id = UUID()
     
     /// 인스턴스 생성 시 호출될 콜백. 팩토리 호출 횟수 추적에 사용됩니다.
-    init(onInit: (@Sendable () -> Void)? = nil) {
-        onInit?()
+    init(onInit: (@Sendable () async -> Void)? = nil) {
+        Task {
+            await onInit?()
+        }
     }
 }
 

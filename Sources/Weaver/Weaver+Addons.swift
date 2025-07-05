@@ -1,4 +1,4 @@
-// Weaver+Addons.swift
+// Weaver/Sources/Weaver/Weaver+Addons.swift
 
 import Foundation
 import os
@@ -55,23 +55,51 @@ public struct DependencyGraph: Sendable {
         self.registrations = registrations
     }
     
-    /// Graphviz 등에서 시각화할 수 있는 DOT 형식의 문자열을 생성합니다.
-    /// - Returns: DOT 언어 형식의 그래프 정의 문자열.
+    /// Graphviz 등에서 시각화할 수 있는, 의존 관계가 포함된 DOT 형식의 문자열을 생성합니다.
     public func generateDotGraph() -> String {
         var dot = "digraph Dependencies {\n"
+        dot += "  // Graph layout and style\n"
         dot += "  rankdir=TB;\n"
-        dot += "  node [shape=box, style=rounded];\n"
-        registrations.forEach { key, registration in
+        dot += "  graph [splines=ortho, nodesep=0.8, ranksep=1.2];\n"
+        dot += "  node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\", penwidth=1.5];\n"
+        dot += "  edge [fontname=\"Helvetica\", fontsize=10, arrowsize=0.8];\n\n"
+
+        // 1. 노드(의존성) 정의
+        dot += "  // Node Definitions\n"
+        registrations.values.forEach { registration in
+            let keyName = registration.keyName
+            let nodeName = keyName.split(separator: ".").last.map(String.init) ?? keyName
+            
             let color: String = switch registration.scope {
             case .container: "lightgreen"
             case .cached: "khaki"
+            case .eagerContainer: "lightblue"
             }
-            dot += "  \"\(key.description)\" [fillcolor=\(color), style=filled];\n"
+            
+            dot += "  \"\(nodeName)\" [label=\"\(nodeName)\\n<\(registration.scope.rawValue)>\"; fillcolor=\(color)];\n"
+        }
+        dot += "\n"
+
+        // 2. 엣지(의존 관계) 정의
+        dot += "  // Edge Definitions\n"
+        registrations.values.forEach { registration in
+            let sourceNodeName = registration.keyName.split(separator: ".").last.map(String.init) ?? registration.keyName
+            
+            // 등록 정보에 저장된 의존성 목록을 순회합니다.
+            registration.dependencies.forEach { dependencyKeyName in
+                // 의존성 키 이름(예: `_loggerKey`)을 사용하여 대상 노드 이름(예: `logger`)을 찾습니다.
+                // 매크로 규칙: `_` + `name` + `Key`
+                if dependencyKeyName.hasPrefix("_") && dependencyKeyName.hasSuffix("Key") {
+                    let targetNodeName = String(dependencyKeyName.dropFirst().dropLast(3))
+                    dot += "  \"\(sourceNodeName)\" -> \"\(targetNodeName)\";\n"
+                }
+            }
         }
         dot += "}"
         return dot
     }
 }
+
 
 // MARK: - ==================== Advanced Caching Feature ====================
 
@@ -109,7 +137,7 @@ public struct CachePolicy: Sendable {
 /// 고급 캐싱 기능을 제공하는 기본 캐시 매니저 액터입니다.
 actor DefaultCacheManager: CacheManaging {
     // MARK: - Properties
-    private let policy: CachePolicy
+    let policy: CachePolicy
     private let logger: WeaverLogger?
     private var cache: [AnyDependencyKey: CacheEntry] = [:]
     private var ongoingCreations: [AnyDependencyKey: Task<any Sendable, Error>] = [:]
