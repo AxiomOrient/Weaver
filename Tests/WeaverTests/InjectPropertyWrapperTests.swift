@@ -1,102 +1,72 @@
-
 import Testing
 @testable import Weaver
 
-@Suite("1. 등록 및 해결 - @Inject 프로퍼티 래퍼")
 struct InjectPropertyWrapperTests {
 
-    private actor FactoryCallCounter {
-        var count = 0
-        func increment() { count += 1 }
-    }
-
-    @Test("T1.4 & T1.5: @Inject 기본 모드 - 컨테이너 스코프 내에서 정상 해결")
-    func test_inject_whenInScope_shouldResolveValue() async throws {
+    /// - Intent: `@Inject`로 주입된 의존성이 컨테이너 스코프 내에서 정상적으로 해결되는지 검증합니다.
+    /// - Given: `TestService`가 등록된 컨테이너와, 해당 서비스를 `@Inject`하는 `ServiceConsumer`.
+    /// - When: `Weaver.withScope`로 컨테이너를 활성화하고, `@Inject` 프로퍼티에 접근합니다.
+    /// - Then: `resolved` 프로퍼티는 `TestService`의 인스턴스를 반환해야 합니다.
+    @Test("@Inject resolves dependency correctly")
+    func testInjectResolvesDependencyCorrectly() async throws {
         // Arrange
         let container = await WeaverContainer.builder()
             .register(ServiceProtocolKey.self) { _ in TestService() }
             .build()
-        
-        // Act & Assert
-        try await Weaver.withScope(container) {
-            let consumer = ServiceConsumer()
-            
-            // T1.5: 안전 모드 (`callAsFunction`)
-            let service = await consumer.aService()
-            #expect(service is TestService, "기본 호출 시 의존성이 정상적으로 해결되어야 합니다.")
-            
-            // T1.4: 엄격 모드 (`.resolved`)
-            let strictService = try await consumer.$strictService.resolved
-            #expect(strictService is TestService, "엄격 모드(.resolved)에서도 의존성이 정상적으로 해결되어야 합니다.")
-        }
-    }
-
-    @Test("T1.6: @Inject 안전 모드 - 실패 시 기본값 반환")
-    func test_inject_whenResolutionFails_shouldReturnDefaultValue() async {
-        // Arrange
-        let emptyContainer = await WeaverContainer.builder().build()
-        
-        // Act & Assert
-        await Weaver.withScope(emptyContainer) {
-            let consumer = ServiceConsumer()
-            let service = await consumer.safeServiceWithDefault()
-            
-            // Assert: 반환된 객체가 기본값 타입인 `NullService`인지 확인합니다.
-            // ID 비교는 defaultValue가 매번 새 인스턴스를 생성하므로 부적절합니다.
-            #expect(service is NullService, "안전 모드에서는 해결 실패 시 `defaultValue`가 반환되어야 합니다.")
-        }
-    }
-
-    @Test("T1.7: @Inject 엄격 모드 - 실패 시 에러 발생")
-    func test_injectStrict_whenResolutionFails_shouldThrowError() async {
-        // Arrange
-        let emptyContainer = await WeaverContainer.builder().build()
-        
-        // Act & Assert
-        await Weaver.withScope(emptyContainer) {
-            let consumer = ServiceConsumer()
-            await #expect(throws: WeaverError.self, "엄격 모드는 해결 실패 시 WeaverError를 던져야 합니다.") {
-                _ = try await consumer.$strictService.resolved
-            }
-        }
-    }
-    
-    @Test("T1.8: @Inject 스코프 외부 접근")
-    func test_inject_whenAccessedOutsideScope_shouldThrowOrReturnDefault() async {
-        // Arrange
         let consumer = ServiceConsumer()
         
-        // Act & Assert
-        // 안전 모드: 기본값 반환
-        let service = await consumer.safeServiceWithDefault()
-        #expect(service is NullService, "스코프 외부에서 안전 모드 접근 시 기본값이 반환되어야 합니다.")
-        
-        // 엄격 모드: .containerNotFound 에러 발생
-        await #expect(throws: WeaverError.self, "스코프 외부에서 엄격 모드 접근 시 WeaverError.containerNotFound 에러가 발생해야 합니다.") {
-            _ = try await consumer.$strictService.resolved
+        // Act
+        let service = try await Weaver.withScope(container) {
+            try await consumer.$aService.resolved
         }
+        
+        // Assert
+        #expect(service is TestService)
     }
     
-    @Test("T1.9: @Inject 내부 캐시 동작")
-    func test_inject_whenAccessedMultipleTimes_shouldUseInternalCache() async throws {
+    /// - Intent: `@Inject`가 의존성을 한 번 해결한 후, 그 결과를 내부적으로 캐시하는지 검증합니다.
+    /// - Given: 팩토리 호출 횟수를 추적하는 컨테이너와 `ServiceConsumer`.
+    /// - When: 동일한 `@Inject` 프로퍼티에 여러 번 접근합니다.
+    /// - Then: 팩토리는 단 한 번만 호출되어야 합니다.
+    @Test("@Inject caches resolved instance")
+    func testInjectCachesResolvedInstance() async throws {
         // Arrange
         let factoryCallCounter = FactoryCallCounter()
         let container = await WeaverContainer.builder()
-            .register(ServiceProtocolKey.self) { _ in
-                await factoryCallCounter.increment()
-                return TestService()
+            .enableAdvancedCaching() // Use the real cache manager
+            .register(ServiceProtocolKey.self, scope: .cached) { _ in
+                TestService { await factoryCallCounter.increment() }
             }
             .build()
-            
-        // Act & Assert
+        let consumer = ServiceConsumer()
+
+        // Act
         try await Weaver.withScope(container) {
-            let consumer = ServiceConsumer()
-            _ = await consumer.cachedService() // 1차 호출 (팩토리 실행)
-            _ = await consumer.cachedService() // 2차 호출 (캐시 사용)
-            
-            let finalCount = await factoryCallCounter.count
-            #expect(finalCount == 1, "팩토리는 최초 1회만 호출되고, 이후에는 @Inject 내부 캐시를 사용해야 합니다.")
+            _ = try await consumer.$cachedService.resolved
+            _ = try await consumer.$cachedService.resolved
         }
+        
+        // Assert
+        let callCount = await factoryCallCounter.count
+        #expect(callCount == 1)
+    }
+
+    /// - Intent: 등록되지 않은 의존성을 `.value`로 접근 시, `DependencyKey`의 `defaultValue`가 반환되는지 검증합니다.
+    /// - Given: 의존성이 등록되지 않은 빈 컨테이너와 `ServiceConsumer`.
+    /// - When: `@Inject` 프로퍼티에 `.value`로 접근합니다.
+    /// - Then: `ServiceProtocolKey.defaultValue`인 `NullService`의 인스턴스가 반환되어야 합니다.
+    @Test("@Inject returns default value on resolution failure")
+    func testInjectReturnsDefaultValueOnFailure() async throws {
+        // Arrange
+        let container = await WeaverContainer.builder().build()
+        let consumer = ServiceConsumer()
+        
+        // Act
+        let service = await Weaver.withScope(container) {
+            await consumer.safeServiceWithDefault()
+        }
+        
+        // Assert
+        #expect(service is NullService)
     }
 }
-

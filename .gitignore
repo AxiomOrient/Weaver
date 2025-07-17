@@ -39,6 +39,10 @@ DerivedData/
 # Credentials
 .netrc
 
+# Kiro
+.Kiro/
 
 # Gemini
 GEMINI.md
+LANGUAGE.md
+TESTCASE.md

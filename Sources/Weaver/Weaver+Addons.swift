@@ -1,4 +1,4 @@
-// Weaver+Addons.swift
+// Weaver/Sources/Weaver/Weaver+Addons.swift
 
 import Foundation
 import os
@@ -8,11 +8,6 @@ import os
 /// 고급 캐시 및 메트릭 기능을 활성화하기 위해 `WeaverBuilder`를 확장합니다.
 extension WeaverBuilder {
     /// 고급 캐시 시스템을 활성화합니다.
-    ///
-    /// 이 메서드를 호출하면, 컨테이너는 TTL, LRU/FIFO 퇴출 정책 등을 지원하는
-    /// `DefaultCacheManager`를 사용하게 됩니다.
-    /// - Parameter policy: 캐시의 최대 크기, TTL, 퇴출 정책 등을 담은 객체입니다. 기본값은 `.default`.
-    /// - Returns: 체이닝을 위해 빌더 자신(`Self`)을 반환합니다.
     @discardableResult
     public func enableAdvancedCaching(policy: CachePolicy = .default) -> Self {
         self.configuration.cachePolicy = policy
@@ -22,10 +17,6 @@ extension WeaverBuilder {
     }
     
     /// 메트릭 수집 기능을 활성화합니다.
-    ///
-    /// 이 메서드를 호출하면, 컨테이너는 의존성 해결 시간, 캐시 히트율 등의
-    /// 상세 정보를 수집하는 `DefaultMetricsCollector`를 사용하게 됩니다.
-    /// - Returns: 체이닝을 위해 빌더 자신(`Self`)을 반환합니다.
     @discardableResult
     public func enableMetricsCollection() -> Self {
         return setMetricsCollectorFactory {
@@ -40,8 +31,6 @@ extension WeaverBuilder {
 /// 의존성 그래프 기능을 활성화하기 위해 `WeaverContainer`를 확장합니다.
 extension WeaverContainer {
     /// 등록된 의존성 정보를 바탕으로 시각화할 수 있는 그래프 객체를 반환합니다.
-    ///
-    /// 이 기능은 디버깅 목적으로 의존성 관계를 파악하는 데 유용합니다.
     public func getDependencyGraph() -> DependencyGraph {
         return DependencyGraph(registrations: registrations)
     }
@@ -55,24 +44,46 @@ public struct DependencyGraph: Sendable {
         self.registrations = registrations
     }
     
-    /// Graphviz 등에서 시각화할 수 있는 DOT 형식의 문자열을 생성합니다.
-    /// - Returns: DOT 언어 형식의 그래프 정의 문자열.
+    /// Graphviz 등에서 시각화할 수 있는, 의존 관계가 포함된 DOT 형식의 문자열을 생성합니다.
     public func generateDotGraph() -> String {
         var dot = "digraph Dependencies {\n"
+        dot += "  // Graph layout and style\n"
         dot += "  rankdir=TB;\n"
-        dot += "  node [shape=box, style=rounded];\n"
-        registrations.forEach { key, registration in
-            let color: String = switch registration.scope {
-            case .container: "lightgreen"
-            case .cached: "khaki"
-            case .transient: "lightblue"
+        dot += "  graph [splines=ortho, nodesep=0.8, ranksep=1.2];\n"
+        dot += "  node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\", penwidth=1.5];\n"
+        dot += "  edge [fontname=\"Helvetica\", fontsize=10, arrowsize=0.8];\n\n"
+
+        // ✨ [로직 개선] 1. 조회용 맵 생성
+        // 프로퍼티 이름(소문자)을 실제 노드 이름(Key 타입 이름)에 매핑합니다.
+        // 예: "circulara" -> "CircularAKey"
+        // 이 맵을 통해 `_serviceAKey` 같은 문자열에서 실제 대상 노드를 찾을 수 있습니다.
+        registrations.values.forEach { registration in
+            let sourceNodeName = registration.keyName.split(separator: ".").last.map(String.init) ?? registration.keyName
+            
+            registration.dependencies.forEach { dependencyDeclaration in
+                if let dependencyRegistration = registrations.first(where: { $0.value.keyName == dependencyDeclaration }) {
+                    let targetNodeName = dependencyRegistration.value.keyName.split(separator: ".").last.map(String.init) ?? dependencyRegistration.value.keyName
+                    dot += "  \"\(sourceNodeName)\" -> \"\(targetNodeName)\";\n"
+                } else {
+                    print("Weaver Graph Warning: Could not find a matching node for dependency '\(dependencyDeclaration)' in '\(registration.keyName)'.")
+                }
             }
-            dot += "  \"\(key.description)\" [fillcolor=\(color), style=filled];\n"
         }
         dot += "}"
         return dot
     }
 }
+
+// MARK: - Private String Helper
+
+/// 하위 버전 호환성을 위해 `removingsuffix` 대신 사용할 헬퍼 확장입니다.
+private extension String {
+    func strippingSuffix(_ suffix: String) -> String? {
+        guard self.hasSuffix(suffix) else { return nil }
+        return String(self.dropLast(suffix.count))
+    }
+}
+
 
 // MARK: - ==================== Advanced Caching Feature ====================
 
@@ -94,6 +105,10 @@ public struct CachePolicy: Sendable {
     public let evictionPolicy: EvictionPolicy
     
     public init(maxSize: Int = 100, ttl: TimeInterval = 300, evictionPolicy: EvictionPolicy = .lru) {
+        // 개발 중 잘못된 설정값을 즉시 발견하여 런타임 오류를 방지합니다.
+        precondition(maxSize > 0, "CachePolicy의 maxSize는 반드시 0보다 커야 합니다.")
+        precondition(ttl > 0, "CachePolicy의 ttl은 반드시 0보다 커야 합니다.")
+
         self.maxSize = maxSize
         self.ttl = ttl
         self.evictionPolicy = evictionPolicy
@@ -106,10 +121,12 @@ public struct CachePolicy: Sendable {
 /// 고급 캐싱 기능을 제공하는 기본 캐시 매니저 액터입니다.
 actor DefaultCacheManager: CacheManaging {
     // MARK: - Properties
-    private let policy: CachePolicy
+    let policy: CachePolicy
     private let logger: WeaverLogger?
     private var cache: [AnyDependencyKey: CacheEntry] = [:]
-    private let accessList = DoublyLinkedList()
+    private var ongoingCreations: [AnyDependencyKey: Task<any Sendable, Error>] = [:]
+    /// LRU와 FIFO 정책 모두를 위한 퇴출 순서 추적기입니다.
+    private let evictionOrderTracker = DoublyLinkedList()
     private var expirationHeap = PriorityQueue<ExpirationEntry>()
     private let memoryMonitor = MemoryMonitor()
     private var cacheHits = 0
@@ -126,13 +143,15 @@ actor DefaultCacheManager: CacheManaging {
     func clear() async {
         await memoryMonitor.stop()
         cache.removeAll()
-        accessList.clear()
+        ongoingCreations.values.forEach { $0.cancel() }
+        ongoingCreations.removeAll()
+        evictionOrderTracker.clear()
         expirationHeap.clear()
         cacheHits = 0
         cacheMisses = 0
     }
     
-    func getOrCreateInstance<T: Sendable>(key: AnyDependencyKey, factory: @Sendable @escaping () async throws -> T) async throws -> (value: T, isHit: Bool) {
+    func taskForInstance<T: Sendable>(key: AnyDependencyKey, factory: @Sendable @escaping () async throws -> T) async -> (task: Task<any Sendable, Error>, isHit: Bool) {
         // 메모리 압박 상황 처리
         if await memoryMonitor.isUnderPressure {
             await logger?.log(message: "⚠️ 경고: 메모리 압박 감지. 캐시의 25%를 제거합니다.", level: .default)
@@ -142,20 +161,40 @@ actor DefaultCacheManager: CacheManaging {
         // 만료된 항목 제거
         evictExpiredEntries()
         
-        // 캐시에서 인스턴스 조회
+        // 1. 캐시에서 인스턴스 조회
         if let entry = cache[key], let value = entry.value as? T {
             if policy.evictionPolicy == .lru {
-                accessList.moveToFront(key: key)
+                // LRU 정책은 접근 시 순서를 갱신하여 가장 최근에 사용되었음을 표시합니다.
+                evictionOrderTracker.moveToFront(key: key)
             }
             cacheHits += 1
-            return (value, true)
+            return (Task { value }, true)
         }
-        
-        // 캐시 미스: 새로운 인스턴스 생성
+
+        // 2. 진행 중인 Task가 있는지 확인
+        if let existingTask = ongoingCreations[key] {
+            return (existingTask, false)
+        }
+
+        // 3. 새로운 Task 생성 및 등록
         cacheMisses += 1
-        let instance = try await factory()
-        addInstanceToCache(instance, forKey: key)
-        return (instance, false)
+        let newTask = Task<any Sendable, Error> {
+            do {
+                let instance = try await factory()
+                addInstanceToCache(instance, forKey: key)
+                await removeOngoingCreation(forKey: key)
+                return instance
+            } catch {
+                await removeOngoingCreation(forKey: key)
+                throw error
+            }
+        }
+        ongoingCreations[key] = newTask
+        return (newTask, false)
+    }
+    
+    private func removeOngoingCreation(forKey key: AnyDependencyKey) async {
+        ongoingCreations.removeValue(forKey: key)
     }
     
     func getMetrics() -> (hits: Int, misses: Int) {
@@ -169,9 +208,9 @@ actor DefaultCacheManager: CacheManaging {
         let entry = CacheEntry(value: instance, ttl: policy.ttl)
         cache[key] = entry
         
-        if policy.evictionPolicy == .lru {
-            accessList.add(key)
-        }
+        // LRU와 FIFO 모두 퇴출 순서 추적을 위해 리스트에 추가합니다.
+        // LRU는 접근 시 순서가 갱신되고, FIFO는 추가된 순서가 그대로 유지됩니다.
+        evictionOrderTracker.add(key)
         expirationHeap.enqueue(ExpirationEntry(key: key, expirationDate: entry.expirationDate, creationDate: entry.createdAt))
     }
     
@@ -193,20 +232,17 @@ actor DefaultCacheManager: CacheManaging {
     private func evict(count: Int = 1) {
         for _ in 0..<count {
             guard !cache.isEmpty else { break }
-            switch policy.evictionPolicy {
-            case .lru:
-                if let key = accessList.removeTail() { removeFromCache(key: key) }
-            case .fifo:
-                if let key = cache.min(by: { $0.value.createdAt < $1.value.createdAt })?.key { removeFromCache(key: key) }
+            // LRU와 FIFO 정책 모두 가장 오래된 항목(리스트의 꼬리)을 제거합니다.
+            if let keyToEvict = evictionOrderTracker.removeTail() {
+                removeFromCache(key: keyToEvict)
             }
         }
     }
     
     private func removeFromCache(key: AnyDependencyKey) {
         if cache.removeValue(forKey: key) != nil {
-            if policy.evictionPolicy == .lru {
-                accessList.remove(key: key)
-            }
+            // 캐시에서 제거되면 순서 추적 리스트에서도 일관되게 제거합니다.
+            evictionOrderTracker.remove(key: key)
         }
     }
 }
@@ -273,7 +309,8 @@ actor DefaultMetricsCollector: MetricsCollecting {
             cacheHits: cacheHits,
             cacheMisses: cacheMisses,
             averageResolutionTime: totalResolutions > 0 ? totalDuration / Double(totalResolutions) : 0,
-            failedResolutions: failedResolutions
+            failedResolutions: failedResolutions,
+            weakReferences: WeakReferenceMetrics(totalWeakReferences: 0, aliveWeakReferences: 0, deallocatedWeakReferences: 0)
         )
     }
 }
