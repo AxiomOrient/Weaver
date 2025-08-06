@@ -49,14 +49,23 @@ actor TestSignal {
 protocol Service: Sendable {
     /// 모든 서비스 인스턴스를 고유하게 식별하기 위한 ID입니다.
     var id: UUID { get }
+    
+    /// 이 인스턴스가 기본값인지 여부를 나타냅니다.
+    /// 테스트에서 실제 해결된 값과 기본값을 구분하기 위해 사용됩니다.
+    var isDefaultValue: Bool { get }
 }
 
 /// 기본 의존성 주입 테스트를 위한 구현체입니다.
 final class TestService: Service, Sendable {
     let id = UUID()
     
+    /// 이 인스턴스가 기본값인지 여부를 나타냅니다.
+    /// 테스트에서 실제 해결된 값과 기본값을 구분하기 위해 사용됩니다.
+    let isDefaultValue: Bool
+    
     /// 인스턴스 생성 시 호출될 콜백. 팩토리 호출 횟수 추적에 사용됩니다.
-    init(onInit: (@Sendable () async -> Void)? = nil) {
+    init(isDefaultValue: Bool = false, onInit: (@Sendable () async -> Void)? = nil) {
+        self.isDefaultValue = isDefaultValue
         Task {
             await onInit?()
         }
@@ -66,24 +75,46 @@ final class TestService: Service, Sendable {
 /// 타입 불일치 및 오버라이드 테스트를 위한 또 다른 서비스 구현체입니다.
 final class AnotherService: Service, Sendable {
     let id = UUID()
+    let isDefaultValue: Bool
+    
+    init(isDefaultValue: Bool = false) {
+        self.isDefaultValue = isDefaultValue
+    }
 }
 
 /// 의존성 해결 실패 시 반환될 기본값을 명확히 하기 위한 'Null Object' 패턴 구현체입니다.
 final class NullService: Service, Sendable {
     let id = UUID()
+    let isDefaultValue: Bool
+    
+    init(isDefaultValue: Bool = true) { // NullService는 기본적으로 기본값
+        self.isDefaultValue = isDefaultValue
+    }
+}
+
+/// 약한 참조 테스트를 위한 서비스입니다.
+final class WeakService: Service, Sendable {
+    let id = UUID()
+    let isDefaultValue: Bool
+    
+    init(isDefaultValue: Bool = false) {
+        self.isDefaultValue = isDefaultValue
+    }
 }
 
 /// `Disposable` 프로토콜을 준수하는 테스트 서비스입니다.
 final class DisposableService: Service, Disposable, Sendable {
     let id = UUID()
+    let isDefaultValue: Bool
     private let onDispose: @Sendable () async -> Void
 
-    init(onDispose: @escaping @Sendable () async -> Void) {
+    init(isDefaultValue: Bool = false, onDispose: @escaping @Sendable () async -> Void) {
+        self.isDefaultValue = isDefaultValue
         self.onDispose = onDispose
     }
 
     /// 컨테이너 `shutdown` 시 `onDispose` 클로저를 호출합니다.
-    func dispose() async {
+    func dispose() async throws {
         await onDispose()
     }
 }
@@ -91,8 +122,11 @@ final class DisposableService: Service, Disposable, Sendable {
 /// 순환 참조 테스트를 위한 서비스 A입니다.
 final class CircularServiceA: Service, Sendable {
     let id = UUID()
+    let isDefaultValue: Bool
     let serviceB: any Service
-    init(serviceB: any Service) {
+    
+    init(isDefaultValue: Bool = false, serviceB: any Service) {
+        self.isDefaultValue = isDefaultValue
         self.serviceB = serviceB
     }
 }
@@ -100,8 +134,11 @@ final class CircularServiceA: Service, Sendable {
 /// 순환 참조 테스트를 위한 서비스 B입니다.
 final class CircularServiceB: Service, Sendable {
     let id = UUID()
+    let isDefaultValue: Bool
     let serviceA: any Service
-    init(serviceA: any Service) {
+    
+    init(isDefaultValue: Bool = false, serviceA: any Service) {
+        self.isDefaultValue = isDefaultValue
         self.serviceA = serviceA
     }
 }
@@ -109,9 +146,12 @@ final class CircularServiceB: Service, Sendable {
 // MARK: - Test Dependency Keys
 
 /// `TestService` 타입에 대한 `DependencyKey`입니다.
+/// 테스트에서 실제 해결된 값과 기본값을 구분하기 위해 기본값으로 특별한 마커를 사용합니다.
 struct ServiceKey: DependencyKey {
     typealias Value = TestService
-    static var defaultValue: TestService { TestService() }
+    static var defaultValue: TestService { 
+        TestService(isDefaultValue: true)
+    }
 }
 
 /// `any Service` 프로토콜 타입에 대한 `DependencyKey`입니다.
@@ -121,23 +161,40 @@ struct ServiceProtocolKey: DependencyKey {
     static var defaultValue: any Service { NullService() }
 }
 
+/// `WeakService` 타입에 대한 `DependencyKey`입니다.
+/// 약한 참조 테스트를 위한 키입니다.
+struct WeakServiceKey: DependencyKey {
+    typealias Value = WeakService
+    static var defaultValue: Value { 
+        WeakService(isDefaultValue: true)
+    }
+}
+
 /// `DisposableService` 타입에 대한 `DependencyKey`입니다.
-/// 기본값 반환 테스트 목적이 아니므로 `fatalError`로 의도치 않은 사용을 방지합니다.
+/// Mock 객체를 기본값으로 제공하여 안전성을 보장합니다.
 struct DisposableServiceKey: DependencyKey {
     typealias Value = DisposableService
-    static var defaultValue: Value { fatalError("Not intended for default value tests.") }
+    static var defaultValue: Value { 
+        DisposableService(isDefaultValue: true, onDispose: { /* Mock dispose - 아무것도 하지 않음 */ })
+    }
 }
 
 /// `CircularServiceA` 타입에 대한 `DependencyKey`입니다.
+/// Mock 객체를 기본값으로 제공하여 순환 참조 없이 안전한 기본값을 제공합니다.
 struct CircularAKey: DependencyKey {
     typealias Value = CircularServiceA
-    static var defaultValue: Value { fatalError("Not intended for default value tests.") }
+    static var defaultValue: Value { 
+        CircularServiceA(isDefaultValue: true, serviceB: NullService()) // 순환 참조 방지를 위한 Mock
+    }
 }
 
 /// `CircularServiceB` 타입에 대한 `DependencyKey`입니다.
+/// Mock 객체를 기본값으로 제공하여 순환 참조 없이 안전한 기본값을 제공합니다.
 struct CircularBKey: DependencyKey {
     typealias Value = CircularServiceB
-    static var defaultValue: Value { fatalError("Not intended for default value tests.") }
+    static var defaultValue: Value { 
+        CircularServiceB(isDefaultValue: true, serviceA: NullService()) // 순환 참조 방지를 위한 Mock
+    }
 }
 
 
