@@ -12,7 +12,7 @@ public enum WeaverError: Error, LocalizedError, Sendable, Equatable {
     case containerFailed(underlying: any Error & Sendable)
     case resolutionFailed(ResolutionError)
     case shutdownInProgress
-    case initializationTimeout(timeoutDuration: TimeInterval)
+
     case dependencyResolutionFailed(keyName: String, currentState: LifecycleState, underlying: any Error & Sendable)
     
     // 🔧 [NEW] 추가 에러 타입들
@@ -32,8 +32,7 @@ public enum WeaverError: Error, LocalizedError, Sendable, Equatable {
             return "의존성 해결에 실패했습니다: \(resolutionError.localizedDescription)"
         case .shutdownInProgress:
             return "컨테이너가 종료 중이므로 의존성을 해결할 수 없습니다."
-        case .initializationTimeout(let timeoutDuration):
-            return "컨테이너 초기화 시간이 초과되었습니다 (\(timeoutDuration)초)"
+
         case .dependencyResolutionFailed(let keyName, let currentState, let underlying):
             return "의존성 '\(keyName)' 해결 실패 - 커널 상태: \(currentState), 원인: \(underlying.localizedDescription)"
         case .criticalDependencyFailed(let keyName, let underlying):
@@ -87,8 +86,7 @@ public enum WeaverError: Error, LocalizedError, Sendable, Equatable {
             return lhsError == rhsError
         case (.shutdownInProgress, .shutdownInProgress):
             return true
-        case (.initializationTimeout(let lhsDuration), .initializationTimeout(let rhsDuration)):
-            return lhsDuration == rhsDuration
+
         case (.dependencyResolutionFailed(let lhsKey, let lhsState, let lhsError), 
               .dependencyResolutionFailed(let rhsKey, let rhsState, let rhsError)):
             return lhsKey == rhsKey && lhsState == rhsState && lhsError.localizedDescription == rhsError.localizedDescription
@@ -105,6 +103,7 @@ public enum ResolutionError: Error, LocalizedError, Sendable, Equatable {
     case typeMismatch(expected: String, actual: String, keyName: String)
     case keyNotFound(keyName: String)
     case weakObjectDeallocated(keyName: String)
+    case containerShutdown
     
     public var errorDescription: String? {
         switch self {
@@ -118,6 +117,8 @@ public enum ResolutionError: Error, LocalizedError, Sendable, Equatable {
             return "'\(keyName)' 키에 대한 등록 정보를 찾을 수 없습니다."
         case .weakObjectDeallocated(let keyName):
             return "'\(keyName)'에 대한 약한 참조(weak) 의존성이 이미 메모리에서 해제되었습니다."
+        case .containerShutdown:
+            return "컨테이너가 종료되어 의존성을 해결할 수 없습니다."
         }
     }
     
@@ -134,6 +135,8 @@ public enum ResolutionError: Error, LocalizedError, Sendable, Equatable {
             return lhsKeyName == rhsKeyName
         case (.weakObjectDeallocated(let lhsKeyName), .weakObjectDeallocated(let rhsKeyName)):
             return lhsKeyName == rhsKeyName
+        case (.containerShutdown, .containerShutdown):
+            return true
         default:
             return false
         }

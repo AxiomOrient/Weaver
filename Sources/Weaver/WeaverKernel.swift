@@ -3,23 +3,29 @@
 import Foundation
 import os
 
-// MARK: - ==================== 통합 Weaver 커널 ====================
+// MARK: - ==================== 스코프 기반 점진적 로딩 커널 ====================
 //
-// DevPrinciples Article 1, 3에 따라 단일 책임과 단순성을 추구하는 유일한 커널입니다.
-// 기존의 여러 커널을 하나로 통합하여 복잡성을 완전히 제거합니다.
+// 핵심 설계 원칙:
+// 1. 앱 시작 시 최소한의 동기 의존성만 등록 (bootstrap 스코프)
+// 2. 스코프별 점진적 로딩으로 앱 반응성 보장
+// 3. 사용 시점에 필요한 스코프만 활성화
+// 4. 명확한 스코프 생명주기 관리
 
-/// Weaver DI 시스템의 유일한 커널 구현체입니다.
-/// 전략 패턴을 통해 다양한 초기화 방식을 지원하는 단일 구현체입니다.
+/// 스코프 기반 점진적 로딩을 지원하는 DI 커널입니다.
+/// 앱 시작 시 동기/비동기 문제를 해결하기 위해 스코프 단위로 의존성을 관리합니다.
 public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     
     // MARK: - Properties
     
     private let modules: [Module]
     private let logger: WeaverLogger
-    private let initializationStrategy: InitializationStrategy
     
-    private var container: WeaverContainer?
-    private var syncContainer: WeaverSyncContainer?
+    // 스코프별 컨테이너 관리
+    private var scopeContainers: [Scope: WeaverContainer] = [:]
+    private var activatedScopes: Set<Scope> = []
+    
+    // 스코프별 등록 정보 캐시
+    private var scopeRegistrations: [Scope: [AnyDependencyKey: DependencyRegistration]] = [:]
     
     // MARK: - State Management
     
@@ -31,22 +37,13 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     public let stateStream: AsyncStream<LifecycleState>
     private let stateContinuation: AsyncStream<LifecycleState>.Continuation
     
-    // MARK: - Initialization Strategy
-    
-    public enum InitializationStrategy: Sendable {
-        case immediate      // 즉시 모든 의존성 초기화
-        case realistic     // 동기 시작 + 지연 초기화 (권장)
-    }
-    
     // MARK: - Initialization
     
     public init(
-        modules: [Module], 
-        strategy: InitializationStrategy = .realistic,
+        modules: [Module],
         logger: WeaverLogger = DefaultLogger()
     ) {
         self.modules = modules
-        self.initializationStrategy = strategy
         self.logger = logger
         
         // AsyncStream 설정
@@ -65,20 +62,36 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     public func build() async {
         await updateState(.configuring)
         
-        switch initializationStrategy {
-        case .immediate:
-            await buildImmediate()
-        case .realistic:
-            await buildRealistic()
-        }
+        // 1단계: 모든 모듈에서 등록 정보 수집
+        await collectRegistrations()
+        
+        // 2단계: Startup 스코프만 즉시 활성화
+        await activateScope(.startup)
+        
+        // 3단계: Ready 상태로 전환
+        await updateState(.ready(self))
+        
+        await logger.log(message: "✅ 커널 빌드 완료 - Startup 스코프 활성화됨", level: .info)
     }
     
     public func shutdown() async {
         await logger.log(message: "🛑 커널 종료 시작", level: .info)
         
-        if let container = container {
-            await container.shutdown()
+        // 활성화된 스코프들을 역순으로 종료
+        let scopesToShutdown = Array(activatedScopes).sorted { lhs, rhs in
+            getScopeShutdownPriority(lhs) > getScopeShutdownPriority(rhs)
         }
+        
+        for scope in scopesToShutdown {
+            if let container = scopeContainers[scope] {
+                await container.shutdown()
+                await logger.log(message: "🛑 스코프 종료: \(scope)", level: .debug)
+            }
+        }
+        
+        scopeContainers.removeAll()
+        activatedScopes.removeAll()
+        scopeRegistrations.removeAll()
         
         await updateState(.shutdown)
         stateContinuation.finish()
@@ -94,32 +107,21 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             return Key.defaultValue
         }
         
-        // 전략에 따른 해결
-        switch initializationStrategy {
-        case .realistic:
-            if let syncContainer = syncContainer {
-                return await syncContainer.safeResolve(keyType)
-            }
-        case .immediate:
-            if case .ready(let resolver) = _currentState {
-                do {
-                    return try await resolver.resolve(keyType)
-                } catch {
-                    await logger.logResolutionFailure(
-                        keyName: String(describing: keyType),
-                        currentState: _currentState,
-                        error: error
-                    )
-                }
-            }
+        do {
+            return try await resolve(keyType)
+        } catch {
+            await logger.logResolutionFailure(
+                keyName: String(describing: keyType),
+                currentState: _currentState,
+                error: error
+            )
+            return Key.defaultValue
         }
-        
-        return Key.defaultValue
     }
     
-    /// 🚀 Swift 6 방식: 타임아웃 없는 현대적 준비 대기
-    /// DevPrinciples Article 3에 따라 블로킹 없는 단순한 구현
-    public func waitForReady(timeout: TimeInterval?) async throws -> any Resolver {
+    /// 커널이 준비 상태인지 확인하고 준비된 경우 resolver를 반환합니다.
+    /// 비동기 라이브러리에서는 대기하지 않고 즉시 상태를 확인합니다.
+    public func waitForReady() async throws -> any Resolver {
         // 이미 준비된 경우
         if case .ready(let resolver) = _currentState {
             return resolver
@@ -130,87 +132,149 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             throw WeaverError.shutdownInProgress
         }
         
-        // realistic 전략의 경우 syncContainer 즉시 반환
-        if initializationStrategy == .realistic, let syncContainer = syncContainer {
-            return syncContainer
-        }
-        
         // 실패 상태인 경우
         if case .failed(let error) = _currentState {
             throw WeaverError.containerFailed(underlying: error)
         }
         
-        // 🚀 Swift 6 방식: AsyncStream을 사용한 논블로킹 대기
-        return try await waitForReadyState()
+        // startup 스코프가 활성화되어 있으면 준비된 것으로 간주
+        if activatedScopes.contains(.startup) {
+            return self
+        }
+        
+        // 준비되지 않은 상태
+        throw WeaverError.containerNotReady(currentState: _currentState)
     }
     
     // MARK: - Resolver Implementation
     
     public func resolve<Key: DependencyKey>(_ keyType: Key.Type) async throws -> Key.Value {
-        switch initializationStrategy {
-        case .realistic:
-            if let syncContainer = syncContainer {
-                return try await syncContainer.resolve(keyType)
-            }
-        case .immediate:
-            guard case .ready(let resolver) = _currentState else {
-                throw WeaverError.containerNotReady(currentState: _currentState)
-            }
-            return try await resolver.resolve(keyType)
+        let key = AnyDependencyKey(keyType)
+        
+        // 1. 어느 스코프에 등록되어 있는지 찾기
+        guard let targetScope = findScopeForKey(key) else {
+            throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
         }
         
-        throw WeaverError.containerNotReady(currentState: _currentState)
+        // 2. 해당 스코프가 활성화되어 있지 않으면 활성화
+        if !activatedScopes.contains(targetScope) {
+            await activateScope(targetScope)
+        }
+        
+        // 3. 스코프 컨테이너에서 해결
+        guard let container = scopeContainers[targetScope] else {
+            throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
+        }
+        
+        return try await container.resolve(keyType)
     }
     
-    // MARK: - Private Build Strategies
+    // MARK: - Scope Management
     
-    private func buildImmediate() async {
-        await logger.log(message: "🏗️ 즉시 초기화 시작", level: .info)
+    /// 모든 모듈에서 등록 정보를 수집하고 스코프별로 분류합니다.
+    private func collectRegistrations() async {
+        await logger.log(message: "� 모실듈 등록 정보 수집 시작", level: .debug)
         
         let builder = await WeaverContainer.builder().withLogger(logger)
         
+        // 모든 모듈 구성
         for module in modules {
             await module.configure(builder)
         }
         
-        let newContainer = await builder.build { progress in
-            await self.updateState(.warmingUp(progress: progress))
+        // 등록 정보를 스코프별로 분류
+        let allRegistrations = await builder.getRegistrations()
+        
+        for (key, registration) in allRegistrations {
+            let scope = registration.scope
+            if scopeRegistrations[scope] == nil {
+                scopeRegistrations[scope] = [:]
+            }
+            scopeRegistrations[scope]![key] = registration
         }
         
-        self.container = newContainer
-        await updateState(.ready(newContainer))
-        
-        await logger.log(message: "✅ 즉시 초기화 완료", level: .info)
+        await logger.log(
+            message: "✅ 등록 정보 수집 완료 - 스코프별 분류: \(scopeRegistrations.keys.map { "\($0)" }.joined(separator: ", "))",
+            level: .debug
+        )
     }
     
-    private func buildRealistic() async {
-        await logger.log(message: "🚀 현실적 초기화 시작", level: .info)
+    /// 지정된 스코프를 활성화합니다.
+    private func activateScope(_ scope: Scope) async {
+        guard !activatedScopes.contains(scope) else {
+            return // 이미 활성화됨
+        }
         
-        // 1단계: 동기 컨테이너 즉시 생성
-        let syncBuilder = WeaverSyncBuilder()
+        await logger.log(message: "🚀 스코프 활성화 시작: \(scope)", level: .debug)
         
-        for module in modules {
-            if let syncModule = module as? SyncModule {
-                syncModule.configure(syncBuilder)
-            } else {
-                // 일반 Module을 SyncModule로 변환하는 어댑터
-                let adapter = ModuleAdapter(module: module)
-                adapter.configure(syncBuilder)
+        // 의존성이 있는 스코프들을 먼저 활성화
+        let dependencies = getScopeDependencies(scope)
+        for dependency in dependencies {
+            if !activatedScopes.contains(dependency) {
+                await activateScope(dependency)
             }
         }
         
-        let newSyncContainer = syncBuilder.build()
-        self.syncContainer = newSyncContainer
-        
-        // 2단계: 즉시 ready 상태로 전환
-        await updateState(.ready(newSyncContainer))
-        
-        // 3단계: 백그라운드에서 eager 서비스 초기화
-        Task.detached { @Sendable [weak self] in
-            await self?.initializeEagerServices(newSyncContainer)
+        // 스코프별 등록 정보로 컨테이너 생성
+        guard let registrations = scopeRegistrations[scope], !registrations.isEmpty else {
+            await logger.log(message: "⚠️ 스코프에 등록된 의존성이 없음: \(scope)", level: .debug)
+            activatedScopes.insert(scope)
+            return
         }
         
-        await logger.log(message: "✅ 현실적 초기화 완료", level: .info)
+        let builder = await WeaverContainer.builder()
+            .withLogger(logger)
+            .withRegistrations(registrations)
+        
+        let container = await builder.build { progress in
+            await self.logger.log(
+                message: "📊 스코프 \(scope) 초기화 진행률: \(Int(progress * 100))%",
+                level: .debug
+            )
+        }
+        
+        scopeContainers[scope] = container
+        activatedScopes.insert(scope)
+        
+        await logger.log(message: "✅ 스코프 활성화 완료: \(scope)", level: .debug)
+    }
+    
+    /// 키가 어느 스코프에 등록되어 있는지 찾습니다.
+    private func findScopeForKey(_ key: AnyDependencyKey) -> Scope? {
+        for (scope, registrations) in scopeRegistrations {
+            if registrations[key] != nil {
+                return scope
+            }
+        }
+        return nil
+    }
+    
+    /// 스코프의 의존성을 반환합니다.
+    private func getScopeDependencies(_ scope: Scope) -> [Scope] {
+        switch scope {
+        case .startup:
+            return [] // 최상위 스코프 - 앱 시작 시 필수
+        case .shared:
+            return [.startup] // startup에 의존
+        case .whenNeeded:
+            return [.startup] // startup에 의존
+        case .weak:
+            return [.startup] // startup에 의존
+        }
+    }
+    
+    /// 스코프 종료 우선순위를 반환합니다 (높을수록 먼저 종료).
+    private func getScopeShutdownPriority(_ scope: Scope) -> Int {
+        switch scope {
+        case .whenNeeded:
+            return 3 // 가장 먼저 종료
+        case .shared:
+            return 2
+        case .weak:
+            return 1
+        case .startup:
+            return 0 // 가장 마지막에 종료
+        }
     }
     
     // MARK: - Helper Methods
@@ -222,88 +286,18 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
         
         await logger.logStateTransition(from: oldState, to: newState, reason: nil)
     }
-    
-    /// 🚀 Swift 6 방식: 타임아웃 없는 순수한 AsyncStream 기반 대기
-    /// DevPrinciples Article 3에 따라 단순하고 명확한 구현
-    private func waitForReadyState() async throws -> any Resolver {
-        // 현재 상태를 다시 한번 확인 (race condition 방지)
-        switch _currentState {
-        case .ready(let resolver):
-            return resolver
-        case .failed(let error):
-            throw WeaverError.containerFailed(underlying: error)
-        case .shutdown:
-            throw WeaverError.shutdownInProgress
-        default:
-            break
-        }
-        
-        // AsyncStream을 사용한 논블로킹 상태 대기
-        for await state in stateStream {
-            switch state {
-            case .ready(let resolver):
-                return resolver
-            case .failed(let error):
-                throw WeaverError.containerFailed(underlying: error)
-            case .shutdown:
-                throw WeaverError.shutdownInProgress
-            default:
-                continue
-            }
-        }
-        
-        // 스트림이 종료된 경우
-        throw WeaverError.shutdownInProgress
-    }
-    
-    private func initializeEagerServices(_ container: WeaverSyncContainer) async {
-        await logger.log(message: "🔥 Eager 서비스 백그라운드 초기화 시작", level: .info)
-        
-        // eager 타이밍 서비스들을 식별하고 초기화
-        // 실제 구현에서는 등록된 의존성의 timing을 확인하여 처리
-        
-        await logger.log(message: "✅ Eager 서비스 백그라운드 초기화 완료", level: .info)
-    }
-}
-
-// MARK: - ==================== Module Adapter ====================
-
-/// 일반 Module을 SyncModule로 변환하는 어댑터입니다.
-/// DevPrinciples Article 1에 따라 기존 코드와의 호환성을 보장합니다.
-private struct ModuleAdapter: SyncModule {
-    private let module: Module
-    
-    init(module: Module) {
-        self.module = module
-    }
-    
-    func configure(_ builder: WeaverSyncBuilder) {
-        // 🚀 Swift 6 방식: 비동기 모듈을 동기 빌더에 안전하게 등록
-        // 현실적 전략에서는 기본값만 등록하고 실제 초기화는 지연
-        
-        // 실제 구현에서는 Module의 등록 정보를 추출하여
-        // SyncBuilder에 기본값 팩토리로 등록하는 방식 사용
-        
-        // 현재는 안전한 기본 구현만 제공
-        // 실제 의존성은 백그라운드에서 초기화됨
-    }
 }
 
 // MARK: - ==================== 편의 생성자 ====================
 
 public extension WeaverKernel {
-    /// 즉시 초기화 전략으로 커널을 생성합니다.
-    static func immediate(modules: [Module], logger: WeaverLogger = DefaultLogger()) -> WeaverKernel {
-        return WeaverKernel(modules: modules, strategy: .immediate, logger: logger)
-    }
-    
-    /// 현실적 초기화 전략으로 커널을 생성합니다. (권장)
-    static func realistic(modules: [Module], logger: WeaverLogger = DefaultLogger()) -> WeaverKernel {
-        return WeaverKernel(modules: modules, strategy: .realistic, logger: logger)
+    /// 스코프 기반 커널을 생성합니다.
+    static func scoped(modules: [Module], logger: WeaverLogger = DefaultLogger()) -> WeaverKernel {
+        return WeaverKernel(modules: modules, logger: logger)
     }
 }
 
-// MARK: - ==================== App Lifecycle Events ====================
+// MARK: - ==================== 앱 생명주기 이벤트 ====================
 
 /// 앱 생명주기 이벤트를 나타내는 열거형입니다.
 public enum AppLifecycleEvent: String, Sendable {
@@ -332,7 +326,7 @@ public extension AppLifecycleAware {
     func appWillTerminate() async throws {}
 }
 
-// MARK: - ==================== Cache Policy ====================
+// MARK: - ==================== 캐시 정책 ====================
 
 /// 캐시 정책을 정의하는 열거형입니다.
 public enum CachePolicy: Sendable {
@@ -342,108 +336,3 @@ public enum CachePolicy: Sendable {
     case disabled
 }
 
-// MARK: - ==================== Convenience Extensions ====================
-
-extension WeaverBuilder {
-    /// 고급 캐싱 기능을 활성화합니다.
-    @discardableResult
-    public func enableAdvancedCaching(policy: CachePolicy = .default) -> Self {
-        return setCacheManagerFactory { policy, logger in
-            DefaultCacheManager(policy: policy, logger: logger)
-        }
-    }
-    
-    /// 메트릭 수집 기능을 활성화합니다.
-    @discardableResult
-    public func enableMetricsCollection() -> Self {
-        return setMetricsCollectorFactory {
-            DefaultMetricsCollector()
-        }
-    }
-}
-
-// MARK: - ==================== Default Implementations ====================
-
-/// 🚀 Swift 6 방식: Actor 기반 캐시 매니저 (Lock-Free)
-/// DevPrinciples Article 5에 따라 동시성 안전성을 actor로 보장
-actor DefaultCacheManager: CacheManaging {
-    private let policy: CachePolicy
-    private let logger: WeaverLogger
-    private var cache: [AnyDependencyKey: (task: Task<any Sendable, Error>, isHit: Bool)] = [:]
-    private var hits = 0
-    private var misses = 0
-    
-    init(policy: CachePolicy, logger: WeaverLogger) {
-        self.policy = policy
-        self.logger = logger
-    }
-    
-    func taskForInstance<T: Sendable>(
-        key: AnyDependencyKey,
-        factory: @Sendable @escaping () async throws -> T
-    ) async -> (task: Task<any Sendable, Error>, isHit: Bool) {
-        
-        // 캐시 확인 (actor 내부에서 동시성 안전)
-        if let cached = cache[key] {
-            hits += 1
-            return (cached.task, true)
-        }
-        
-        // 새 태스크 생성
-        let newTask = Task<any Sendable, Error> {
-            try await factory()
-        }
-        
-        cache[key] = (newTask, false)
-        misses += 1
-        
-        return (newTask, false)
-    }
-    
-    func getMetrics() async -> (hits: Int, misses: Int) {
-        return (hits, misses)
-    }
-    
-    func clear() async {
-        cache.removeAll()
-    }
-}
-
-/// 🚀 Swift 6 방식: Actor 기반 메트릭 수집기 (Lock-Free)
-/// DevPrinciples Article 5에 따라 동시성 안전성을 actor로 보장
-actor DefaultMetricsCollector: MetricsCollecting {
-    private var totalResolutions = 0
-    private var totalDuration: TimeInterval = 0
-    private var failedResolutions = 0
-    
-    func recordResolution(duration: TimeInterval) async {
-        totalResolutions += 1
-        totalDuration += duration
-    }
-    
-    func recordFailure() async {
-        failedResolutions += 1
-    }
-    
-    func recordCache(hit: Bool) async {
-        // 캐시 메트릭은 CacheManager에서 관리
-    }
-    
-    func getMetrics(cacheHits: Int, cacheMisses: Int) async -> ResolutionMetrics {
-        let averageTime = totalResolutions > 0 ? 
-            totalDuration / Double(totalResolutions) : 0
-        
-        return ResolutionMetrics(
-            totalResolutions: totalResolutions,
-            cacheHits: cacheHits,
-            cacheMisses: cacheMisses,
-            averageResolutionTime: averageTime,
-            failedResolutions: failedResolutions,
-            weakReferences: WeakReferenceMetrics(
-                totalWeakReferences: 0,
-                aliveWeakReferences: 0,
-                deallocatedWeakReferences: 0
-            )
-        )
-    }
-}

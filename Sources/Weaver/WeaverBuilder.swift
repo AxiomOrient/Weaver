@@ -20,6 +20,7 @@ public actor WeaverBuilder {
   private var logger: WeaverLogger = DefaultLogger()
   private var cacheManagerFactory: (@Sendable (CachePolicy, WeaverLogger) -> CacheManaging)?
   private var metricsCollectorFactory: (@Sendable () -> MetricsCollecting)?
+  private var priorityProvider: ServicePriorityProvider = DefaultServicePriorityProvider()
 
   // MARK: - Initialization
 
@@ -30,15 +31,13 @@ public actor WeaverBuilder {
   /// 의존성을 컨테이너에 등록합니다.
   /// - Parameters:
   ///   - keyType: 등록할 의존성의 키 타입
-  ///   - scope: 인스턴스 생명주기 관리 방식 (기본값: .container)
-  ///   - timing: 초기화 시점 (기본값: .onDemand)
+  ///   - scope: 인스턴스 생명주기 관리 방식 (기본값: .shared)
   ///   - dependencies: 의존성 그래프 분석용 (선택적)
   ///   - factory: 인스턴스 생성 클로저
   @discardableResult
   public func register<Key: DependencyKey>(
     _ keyType: Key.Type,
-    scope: Scope = .container,
-    timing: InitializationTiming = .onDemand,
+    scope: Scope = .shared,
     dependencies: [String] = [],
     factory: @escaping @Sendable (Resolver) async throws -> Key.Value
   ) -> Self {
@@ -55,7 +54,6 @@ public actor WeaverBuilder {
     }
     registrations[key] = DependencyRegistration(
       scope: scope,
-      timing: timing,
       factory: { resolver in try await factory(resolver) },
       keyName: String(describing: keyType),
       dependencies: dependencies
@@ -70,14 +68,12 @@ public actor WeaverBuilder {
   ///
   /// - Parameters:
   ///   - keyType: 등록할 의존성의 `DependencyKey` 타입. `Value`는 반드시 클래스여야 합니다.
-  ///   - timing: 초기화 시점 (기본값: .onDemand)
   ///   - dependencies: 의존성 그래프 분석을 위한 의존성 이름 목록.
   ///   - factory: 의존성 인스턴스를 생성하는 클로저.
   /// - Returns: 체이닝을 위해 빌더 자신(`Self`)을 반환합니다.
   @discardableResult
   public func registerWeak<Key: DependencyKey>(
     _ keyType: Key.Type,
-    timing: InitializationTiming = .onDemand,
     dependencies: [String] = [],
     factory: @escaping @Sendable (Resolver) async throws -> Key.Value
   ) -> Self where Key.Value: AnyObject {  // ✨ 컴파일 타임에 클래스 타입 제약 강제
@@ -90,7 +86,6 @@ public actor WeaverBuilder {
     }
     registrations[key] = DependencyRegistration(
       scope: .weak,  // 스코프를 .weak로 고정
-      timing: timing,
       factory: { resolver in try await factory(resolver) },
       keyName: String(describing: keyType),
       dependencies: dependencies
@@ -116,6 +111,14 @@ public actor WeaverBuilder {
   @discardableResult
   public func withLogger(_ logger: WeaverLogger) -> Self {
     self.logger = logger
+    return self
+  }
+  
+  /// 서비스 초기화 우선순위 제공자를 설정합니다.
+  /// 복잡한 앱에서 특별한 초기화 순서가 필요한 경우 사용합니다.
+  @discardableResult
+  public func withPriorityProvider(_ provider: ServicePriorityProvider) -> Self {
+    self.priorityProvider = provider
     return self
   }
 
@@ -147,7 +150,7 @@ public actor WeaverBuilder {
   @discardableResult
   public func override<Key: DependencyKey>(
     _ keyType: Key.Type,
-    scope: Scope = .container,
+    scope: Scope = .shared,
     factory: @escaping @Sendable (Resolver) async throws -> Key.Value
   ) -> Self {
     let key = AnyDependencyKey(keyType)
@@ -185,6 +188,15 @@ public actor WeaverBuilder {
       await module.configure(self)
     }
     return registrations
+  }
+  
+  /// 등록 정보를 직접 설정합니다 (스코프 기반 커널 내부 사용).
+  @discardableResult
+  internal func withRegistrations(_ newRegistrations: [AnyDependencyKey: DependencyRegistration]) -> Self {
+    for (key, registration) in newRegistrations {
+      registrations[key] = registration
+    }
+    return self
   }
 
   /// 앱 서비스 초기화 진행률 콜백을 지원하는 `build` 메서드입니다.

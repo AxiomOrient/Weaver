@@ -111,9 +111,9 @@ public protocol SafeResolver: Sendable {
     /// 준비되지 않은 경우 `DependencyKey`의 `defaultValue`를 반환합니다.
     func safeResolve<Key: DependencyKey>(_ keyType: Key.Type) async -> Key.Value
     
-    /// 컨테이너가 준비 완료 상태가 될 때까지 대기합니다.
-    /// 타임아웃이나 실패 시 에러를 발생시킵니다.
-    func waitForReady(timeout: TimeInterval?) async throws -> any Resolver
+    /// 컨테이너가 준비 완료 상태인지 확인합니다.
+    /// 준비되지 않은 경우 즉시 에러를 발생시킵니다.
+    func waitForReady() async throws -> any Resolver
 }
 
 /// 두 프로토콜을 조합하여 완전한 커널 기능을 제공하는 프로토콜입니다.

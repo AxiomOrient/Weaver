@@ -6,7 +6,6 @@ import os
 // MARK: - ==================== Weaver Namespace ====================
 
 /// Weaver의 전역적인 설정 및 범위 관리를 위한 동시성 안전한 Actor입니다.
-/// DevPrinciples Article 1, 2, 5를 준수하여 단일 책임과 품질을 보장합니다.
 public actor WeaverGlobalState {
     // MARK: - Private Properties
     
@@ -59,7 +58,6 @@ public actor WeaverGlobalState {
     }
     
     /// 전역 커널을 설정하고 상태 모니터링을 시작합니다.
-    /// DevPrinciples Article 10에 따라 명시적 에러 처리를 제공합니다.
     public func setGlobalKernel(_ kernel: (any WeaverKernelProtocol)?) async {
         // 기존 관찰 작업 정리
         stateObservationTask?.cancel()
@@ -84,7 +82,6 @@ public actor WeaverGlobalState {
     }
     
     /// 완전한 크래시 방지 시스템 - 모든 상황에서 안전한 의존성 해결
-    /// DevPrinciples Article 2, 3에 따라 안정적이고 명확한 구현을 제공합니다.
     public func safeResolve<Key: DependencyKey>(_ keyType: Key.Type) async -> Key.Value {
         // 1단계: Preview 환경 감지 (최우선)
         if WeaverEnvironment.isPreview {
@@ -115,15 +112,13 @@ public actor WeaverGlobalState {
     }
     
     /// 커널이 준비 완료 상태가 될 때까지 대기합니다.
-    /// DevPrinciples Article 10에 따라 명확한 에러 전파를 제공합니다.
-    /// 🚀 Swift 6 방식: 타임아웃 없는 현대적 대기
     public func waitForReady() async throws -> any Resolver {
         guard let kernel = globalKernel else {
             await logger.log(message: "전역 커널이 설정되지 않음. waitForReady 실패", level: .error)
             throw WeaverError.containerNotFound
         }
         
-        return try await kernel.waitForReady(timeout: nil)
+        return try await kernel.waitForReady()
     }
     
     /// 현재 설정된 스코프 매니저를 반환합니다.
@@ -137,62 +132,31 @@ public actor WeaverGlobalState {
         self.scopeManager = manager
     }
     
-    /// 앱 시작 시 의존성 시스템을 초기화합니다.
-    /// DevPrinciples Article 2, 3에 따라 안정적이고 명확한 초기화를 제공합니다.
-    /// - Parameters:
-    ///   - modules: 등록할 모듈 배열
-    ///   - strategy: 초기화 전략 (기본값: .realistic)
-    /// - Throws: 초기화 실패 시 WeaverError
-    public func initializeForApp(
-        modules: [Module], 
-        strategy: WeaverKernel.InitializationStrategy = .realistic
-    ) async throws {
-        await logger.log(message: "🚀 앱 의존성 시스템 초기화 시작", level: .info)
-        
-        let kernel = WeaverKernel(modules: modules, strategy: strategy, logger: logger)
-        await setGlobalKernel(kernel)
-        await kernel.build()
-        
-        // 🚀 Swift 6 방식: 타임아웃 없이 준비 상태 대기
-        _ = try await kernel.waitForReady(timeout: nil)
-        await logger.log(message: "✅ 앱 의존성 시스템 초기화 완료", level: .info)
-    }
+
     
-    /// 현실적 DI 시스템을 설정합니다.
-    /// App.init()에서 블로킹 없이 즉시 사용 가능한 시스템을 구성합니다.
-    /// - Parameters:
-    ///   - modules: 등록할 모듈 배열
+    /// 스코프 기반 점진적 로딩으로 DI 시스템을 설정합니다.
+    /// 앱 시작 시 Bootstrap 스코프만 즉시 활성화하고, 나머지는 사용 시점에 로딩합니다.
+    /// - Parameter modules: 등록할 모듈 배열
     /// - Returns: 설정된 커널
     @discardableResult
-    public func setupRealistic(modules: [Module]) async -> WeaverKernel {
-        await logger.log(message: "🚀 현실적 DI 시스템 설정 시작", level: .info)
+    public func setupScoped(modules: [Module]) async -> WeaverKernel {
+        await logger.log(message: "🚀 스코프 기반 DI 시스템 설정 시작", level: .info)
         
-        let kernel = WeaverKernel.realistic(modules: modules, logger: logger)
+        let kernel = WeaverKernel.scoped(modules: modules, logger: logger)
         await setGlobalKernel(kernel)
         await kernel.build()
         
-        await logger.log(message: "✅ 현실적 DI 시스템 설정 완료", level: .info)
+        await logger.log(message: "✅ 스코프 기반 DI 시스템 설정 완료", level: .info)
         return kernel
     }
     
 
     
-    /// Eager 타이밍 서비스들을 백그라운드에서 초기화합니다.
-    private func initializeEagerServices(_ container: WeaverSyncContainer) async {
-        await logger.log(message: "🔥 Eager 서비스 초기화 시작", level: .info)
-        
-        // 실제 구현에서는 eager 타이밍 서비스들을 식별하고 초기화
-        // 여기서는 개념적 구현만 제시
-        
-        await logger.log(message: "✅ Eager 서비스 초기화 완료", level: .info)
-    }
-    
 
-    
+
 
     
     /// 테스트용 완전한 상태 초기화 메서드
-    /// DevPrinciples Article 11에 따라 테스트 격리를 보장합니다.
     public func resetForTesting() async {
         // 기존 관찰 작업 정리
         stateObservationTask?.cancel()
@@ -215,51 +179,6 @@ public actor WeaverGlobalState {
         await logger.log(message: "🧪 테스트용 전역 상태 완전 초기화 완료", level: .debug)
     }
     
-    /// 🧪 [NEW] 테스트 전용 격리된 환경에서 코드를 실행합니다.
-    /// 테스트 실행 전후로 완전한 상태 격리를 보장합니다.
-    public func withIsolatedTestEnvironment<T: Sendable>(
-        modules: [Module] = [],
-        operation: @escaping @Sendable () async throws -> T
-    ) async rethrows -> T {
-        // 1. 현재 상태 백업
-        let originalKernel = globalKernel
-        let originalState = cachedKernelState
-        let originalScopeManager = scopeManager
-        
-        // 2. 테스트용 상태 초기화
-        await resetForTesting()
-        
-        // 3. 테스트용 커널 설정 (모듈이 제공된 경우)
-        if !modules.isEmpty {
-            let testKernel = WeaverKernel(modules: modules, strategy: .immediate)
-            await setGlobalKernel(testKernel)
-            await testKernel.build()
-            _ = try? await testKernel.waitForReady(timeout: nil)
-        }
-        
-        do {
-            // 4. 격리된 환경에서 테스트 실행
-            let result = try await operation()
-            
-            // 5. 테스트 후 정리
-            await resetForTesting()
-            
-            // 6. 원래 상태 복원
-            globalKernel = originalKernel
-            cachedKernelState = originalState
-            scopeManager = originalScopeManager
-            
-            return result
-        } catch {
-            // 에러 발생 시에도 상태 복원
-            await resetForTesting()
-            globalKernel = originalKernel
-            cachedKernelState = originalState
-            scopeManager = originalScopeManager
-            
-            throw error
-        }
-    }
     
     /// 특정 컨테이너를 현재 작업 범위로 설정하고 주어진 `operation`을 실행합니다.
     public func withScope<R: Sendable>(_ container: WeaverContainer, operation: @Sendable () async throws -> R) async rethrows -> R {
@@ -351,8 +270,7 @@ public actor WeaverGlobalState {
     }
 }
 
-/// 편의를 위한 전역 접근 인터페이스 (기존 API 호환성 유지)
-/// DevPrinciples Article 1에 따라 중복 코드를 완전히 제거하고 WeaverGlobalState로 위임합니다.
+/// 편의를 위한 전역 접근 인터페이스
 public enum Weaver {
     /// WeaverGlobalState 싱글톤에 대한 편의 접근자
     public static var shared: WeaverGlobalState { WeaverGlobalState.shared }
@@ -389,7 +307,6 @@ public enum Weaver {
     }
     
     /// 커널이 준비 완료 상태가 될 때까지 대기합니다.
-    /// 🚀 Swift 6 방식: 타임아웃 없는 현대적 대기
     /// - Returns: 준비된 Resolver 인스턴스
     /// - Throws: WeaverError (커널 없음, 실패 등)
     public static func waitForReady() async throws -> any Resolver {
@@ -426,13 +343,16 @@ public enum Weaver {
     /// 앱 시작 시 의존성 시스템을 초기화하는 편의 메서드
     /// - Parameters:
     ///   - modules: 등록할 모듈 배열
-    ///   - strategy: 초기화 전략 (기본값: .realistic)
     /// - Throws: 초기화 실패 시 WeaverError
-    public static func initializeForApp(
-        modules: [Module], 
-        strategy: WeaverKernel.InitializationStrategy = .realistic
-    ) async throws {
-        try await shared.initializeForApp(modules: modules, strategy: strategy)
+    public static func setup(modules: [Module]) async throws {
+        await shared.logger.log(message: "🚀 앱 의존성 시스템 초기화 시작", level: .info)
+        
+        let kernel = WeaverKernel.scoped(modules: modules, logger: shared.logger)
+        await shared.setGlobalKernel(kernel)
+        await kernel.build()
+        
+        _ = try await kernel.waitForReady()
+        await shared.logger.log(message: "✅ 앱 의존성 시스템 초기화 완료", level: .info)
     }
     
 
@@ -440,19 +360,18 @@ public enum Weaver {
 
     
     /// 테스트용 완전한 상태 초기화
-    /// DevPrinciples Article 11에 따라 테스트 격리를 보장합니다.
     public static func resetForTesting() async {
         await shared.resetForTesting()
     }
     
-    /// 현실적 DI 시스템을 설정하는 편의 메서드
-    /// App.init()에서 블로킹 없이 즉시 사용 가능한 시스템을 구성합니다.
+    /// 스코프 기반 DI 시스템을 설정하는 편의 메서드 (고급 사용자용)
+    /// 앱 시작 시 Bootstrap 스코프만 즉시 활성화하고, 나머지는 사용 시점에 로딩합니다.
     /// - Parameters:
     ///   - modules: 등록할 모듈 배열
     /// - Returns: 설정된 커널
     @discardableResult
-    public static func setupRealistic(modules: [Module]) async -> WeaverKernel {
-        await shared.setupRealistic(modules: modules)
+    public static func setupScoped(modules: [Module]) async -> WeaverKernel {
+        await shared.setupScoped(modules: modules)
     }
     
 
@@ -461,7 +380,6 @@ public enum Weaver {
 // MARK: - ==================== @Inject Property Wrapper ====================
 
 /// 의존성을 선언하고 주입받기 위한 프로퍼티 래퍼입니다.
-/// DevPrinciples Article 3에 따라 단순하고 명확한 2가지 사용법만 제공합니다.
 ///
 /// 사용법:
 /// ```
@@ -500,7 +418,6 @@ public struct Inject<Key: DependencyKey>: Sendable {
     }
 
     /// 기본 안전 의존성 접근 방식입니다. `await myService()`와 같이 함수처럼 호출하여 사용합니다.
-    /// DevPrinciples Article 3에 따라 단순하고 명확한 안전망을 제공합니다.
     /// 어떤 상황에서도 크래시하지 않으며, 실패 시 `Key.defaultValue`를 반환합니다.
     public func callAsFunction() async -> Key.Value {
         let keyName = String(describing: keyType)

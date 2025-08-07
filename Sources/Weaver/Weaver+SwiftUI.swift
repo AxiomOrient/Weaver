@@ -94,8 +94,8 @@ public struct WeaverViewModifier: ViewModifier {
                 let kernel = WeaverKernel(modules: modules)
                 await Weaver.setGlobalKernel(kernel)
                 await kernel.build()
-                // 🚀 Swift 6 방식: 타임아웃 없는 준비 대기
-                _ = try await kernel.waitForReady(timeout: nil)
+                // 🚀 Swift 6 방식: 안전한 타임아웃 기반 준비 대기
+                _ = try await kernel.waitForReady()
             }
             
             await MainActor.run {
@@ -158,23 +158,44 @@ public struct PreviewWeaverContainer {
     }
     
     /// 여러 Preview 의존성을 한 번에 등록하는 편의 메서드입니다.
-    public static func previewModules(_ registrations: [(any DependencyKey.Type, any Sendable)]) -> [Module] {
-        return registrations.map { keyType, mockValue in
+    /// 타입 안전성을 보장하면서 동적으로 의존성을 등록합니다.
+    public static func previewModules(_ registrations: PreviewRegistration...) -> [Module] {
+        return registrations.map { registration in
             AnonymousModule { builder in
-                // 타입 안전성을 위한 동적 등록
-                await registerDynamically(builder: builder, keyType: keyType, value: mockValue)
+                await registration.configure(builder)
             }
         }
     }
     
-    private static func registerDynamically(
-        builder: WeaverBuilder,
-        keyType: any DependencyKey.Type,
-        value: any Sendable
-    ) async {
-        // 런타임에 타입을 매칭하여 등록
-        // 실제 구현에서는 타입 안전성을 보장하는 추가 로직이 필요
-        // 여기서는 개념적 구현만 제시
+    /// 타입 안전한 Preview 등록을 위한 헬퍼 구조체
+    public struct PreviewRegistration: Sendable {
+        private let registerBlock: @Sendable (WeaverBuilder) async -> Void
+        
+        /// 타입 안전한 Preview 등록을 생성합니다.
+        public static func register<Key: DependencyKey>(
+            _ keyType: Key.Type,
+            mockValue: Key.Value,
+            scope: Scope = .shared
+        ) -> PreviewRegistration {
+            return PreviewRegistration { builder in
+                await builder.register(keyType, scope: scope) { _ in mockValue }
+            }
+        }
+        
+        /// 팩토리 기반 Preview 등록을 생성합니다.
+        public static func register<Key: DependencyKey>(
+            _ keyType: Key.Type,
+            scope: Scope = .shared,
+            factory: @escaping @Sendable (Resolver) async throws -> Key.Value
+        ) -> PreviewRegistration {
+            return PreviewRegistration { builder in
+                await builder.register(keyType, scope: scope, factory: factory)
+            }
+        }
+        
+        internal func configure(_ builder: WeaverBuilder) async {
+            await registerBlock(builder)
+        }
     }
 }
 
@@ -190,6 +211,104 @@ public struct AnonymousModule: Module {
     
     public func configure(_ builder: WeaverBuilder) async {
         await configureBlock(builder)
+    }
+}
+
+#endif
+// MARK: - ==================== Preview Usage Examples ====================
+
+#if DEBUG
+@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+public extension PreviewWeaverContainer {
+    /// 일반적인 Preview 시나리오를 위한 편의 메서드들
+    
+    /// 네트워크 서비스 Mock을 생성합니다.
+    static func mockNetworkService(baseURL: String = "https://preview.api.com") -> PreviewRegistration {
+        return .register(NetworkServiceKey.self) { _ in
+            MockNetworkService(baseURL: baseURL)
+        }
+    }
+    
+    /// 데이터베이스 서비스 Mock을 생성합니다.
+    static func mockDatabaseService(connectionString: String = "preview://memory") -> PreviewRegistration {
+        return .register(DatabaseServiceKey.self) { _ in
+            MockDatabaseService(connectionString: connectionString)
+        }
+    }
+    
+    /// 로거 서비스 Mock을 생성합니다.
+    static func mockLoggerService(level: MockLoggerService.LogLevel = .debug) -> PreviewRegistration {
+        return .register(LoggerServiceKey.self) { _ in
+            MockLoggerService(level: level)
+        }
+    }
+}
+
+// MARK: - Mock Services for Preview
+
+/// Preview용 Mock 네트워크 서비스
+public final class MockNetworkService: Sendable {
+    public let baseURL: String
+    public let id = UUID()
+    
+    public init(baseURL: String) {
+        self.baseURL = baseURL
+    }
+    
+    public func fetchData(endpoint: String) async -> String {
+        return "mock_data_from_\(endpoint)"
+    }
+}
+
+/// Preview용 Mock 데이터베이스 서비스
+public final class MockDatabaseService: Sendable {
+    public let connectionString: String
+    public let id = UUID()
+    
+    public init(connectionString: String) {
+        self.connectionString = connectionString
+    }
+    
+    public func query(_ sql: String) async -> [String] {
+        return ["mock_result_1", "mock_result_2"]
+    }
+}
+
+/// Preview용 Mock 로거 서비스
+public final class MockLoggerService: Sendable {
+    public let level: LogLevel
+    public let id = UUID()
+    
+    public enum LogLevel: String, Sendable {
+        case debug, info, warning, error
+    }
+    
+    public init(level: LogLevel) {
+        self.level = level
+    }
+    
+    public func log(_ message: String, level: LogLevel = .info) {
+        print("[PREVIEW-\(level.rawValue.uppercased())] \(message)")
+    }
+}
+
+// MARK: - Mock Dependency Keys
+
+public struct NetworkServiceKey: DependencyKey {
+    public static var defaultValue: MockNetworkService { 
+        MockNetworkService(baseURL: "https://default.com") 
+    }
+}
+
+public struct DatabaseServiceKey: DependencyKey {
+    public static var defaultValue: MockDatabaseService { 
+        MockDatabaseService(connectionString: "default://localhost") 
+    }
+}
+
+public struct LoggerServiceKey: DependencyKey {
+    public static var defaultValue: MockLoggerService { 
+        MockLoggerService(level: .info) 
     }
 }
 

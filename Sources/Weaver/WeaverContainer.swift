@@ -11,8 +11,7 @@
 import Foundation
 import os
 
-/// 🔧 [REFACTORED] 의존성 해결만 담당하는 핵심 컨테이너
-/// DevPrinciples Article 5 Rule 2: 의존성 분리를 통한 테스트 가능성 극대화
+/// 의존성 해결을 담당하는 핵심 컨테이너
 public actor WeaverContainer: Resolver {
 
   // MARK: - Core Dependencies
@@ -20,6 +19,10 @@ public actor WeaverContainer: Resolver {
   private let resolutionCoordinator: ResolutionCoordinator
   private let lifecycleManager: ContainerLifecycleManager
   private let metricsCollector: MetricsCollecting
+
+  // MARK: - State Management
+
+  private var isShutdown = false
 
   public let registrations: [AnyDependencyKey: DependencyRegistration]
   nonisolated public let logger: WeaverLogger?
@@ -40,7 +43,7 @@ public actor WeaverContainer: Resolver {
     self.logger = logger
     self.metricsCollector = metricsCollector
 
-    // 🚨 [FIXED] 순환 참조 제거 - 단일 코디네이터로 통합
+    // 단일 코디네이터로 통합
     self.resolutionCoordinator = ResolutionCoordinator(
       registrations: registrations,
       parent: parent,
@@ -56,6 +59,11 @@ public actor WeaverContainer: Resolver {
   // MARK: - Public API
 
   public func resolve<Key: DependencyKey>(_ keyType: Key.Type) async throws -> Key.Value {
+    // Shutdown 상태 체크
+    guard !isShutdown else {
+      throw WeaverError.resolutionFailed(.containerShutdown)
+    }
+
     let startTime = CFAbsoluteTimeGetCurrent()
 
     do {
@@ -82,6 +90,12 @@ public actor WeaverContainer: Resolver {
   }
 
   public func shutdown() async {
+    // 이미 종료된 경우 중복 실행 방지
+    guard !isShutdown else { return }
+
+    // 종료 상태로 설정
+    isShutdown = true
+
     // 앱 종료 이벤트 먼저 처리
     await lifecycleManager.handleAppWillTerminate(
       registrations: registrations,
@@ -129,12 +143,14 @@ public actor WeaverContainer: Resolver {
   }
 
   /// AppService 스코프의 의존성들을 앱 상태 변화에 대응할 수 있도록 초기화합니다.
-  /// 🚨 [FIXED] Critical Issue #1: 앱 서비스 초기화 순서 보장
-  /// DevPrinciples Article 5 Rule 1: 의존성 순서를 엄격히 준수하여 순차 초기화
+  /// 의존성 순서를 보장하여 순차적으로 초기화합니다.
   public func initializeAppServiceDependencies(
     onProgress: @escaping @Sendable (Double) async -> Void
   ) async {
-    let appServiceKeys = registrations.filter { $1.scope == .appService }.map { $0.key }
+    let appServiceKeys = registrations.filter { 
+      // startup 스코프의 서비스들을 앱 서비스로 간주
+      $1.scope == .startup 
+    }.map { $0.key }
     guard !appServiceKeys.isEmpty else {
       await onProgress(1.0)
       return
@@ -149,16 +165,15 @@ public actor WeaverContainer: Resolver {
 
     // 🔧 [CRITICAL FIX] 앱 서비스는 의존성 순서가 중요하므로 우선순위 기반 순차 초기화
     // 로깅 → 설정 → 분석 → 네트워크 순서로 엄격하게 순차 처리
-    let prioritizedKeys = await lifecycleManager.prioritizeAppServiceKeys(appServiceKeys)
+    let prioritizedKeys = await lifecycleManager.prioritizeAppServiceKeys(appServiceKeys, registrations: registrations)
 
-    // 🚨 [FIXED] TaskGroup 병렬 처리 → 순차 for 루프로 변경
     // 의존성 순서 보장을 위해 순차적으로 초기화
     var failedServices: [String] = []
     var criticalFailures: [String] = []
 
     for (index, key) in prioritizedKeys.enumerated() {
       let serviceName = key.description
-      let priority = await lifecycleManager.getAppServicePriority(for: key)
+      let priority = await lifecycleManager.getAppServicePriority(for: key, registrations: registrations)
 
       do {
         _ = try await resolutionCoordinator.resolve(key)
@@ -174,7 +189,7 @@ public actor WeaverContainer: Resolver {
           level: .error
         )
 
-        // 🔧 [IMPROVED] 우선순위별 실패 처리 전략
+        // 우선순위별 실패 처리
         failedServices.append(serviceName)
 
         // Priority 0-1 (로깅, 설정)은 Critical 실패로 분류
@@ -186,8 +201,7 @@ public actor WeaverContainer: Resolver {
           )
         }
 
-        // 🔧 [RESILIENCE] 중요 서비스 실패 시에도 계속 진행하되 상태 추적
-        // 완전한 앱 중단보다는 부분적 기능 제한으로 대응
+        // 중요 서비스 실패 시에도 계속 진행하되 상태 추적
       }
 
       // 진행률 업데이트 (순차 처리로 정확한 진행률 보장)
@@ -195,7 +209,7 @@ public actor WeaverContainer: Resolver {
       await onProgress(progress)
     }
 
-    // 🔧 [IMPROVED] 초기화 결과 요약 로깅
+    // 초기화 결과 요약 로깅
     if !failedServices.isEmpty {
       await logger?.log(
         message:
@@ -215,7 +229,7 @@ public actor WeaverContainer: Resolver {
     // 최종 진행률 업데이트 보장
     await onProgress(1.0)
 
-    // 🔧 [IMPROVED] 초기화 완료 요약 및 성능 메트릭
+    // 초기화 완료 요약 및 성능 메트릭
     let successCount = totalCount - failedServices.count
     let successRate = totalCount > 0 ? Double(successCount) / Double(totalCount) * 100 : 100
 
@@ -254,8 +268,7 @@ public actor WeaverContainer: Resolver {
 
 // MARK: - ==================== 통합된 해결 코디네이터 ====================
 
-/// 🚨 [FIXED] 의존성 해결과 스코프 관리를 통합한 단일 Actor
-/// DevPrinciples Article 7 Rule 1: 단일 명확한 책임 - 의존성 해결 조정
+/// 의존성 해결과 스코프 관리를 담당하는 Actor
 actor ResolutionCoordinator: Resolver {
   private let registrations: [AnyDependencyKey: DependencyRegistration]
   private let parent: WeaverContainer?
@@ -336,7 +349,7 @@ actor ResolutionCoordinator: Resolver {
     registration: DependencyRegistration
   ) async throws -> any Sendable {
     switch registration.scope {
-    case .container, .appService, .cached, .bootstrap, .core, .feature:
+    case .shared, .startup, .whenNeeded:
       return try await getOrCreateContainerInstance(key: key, registration: registration)
     case .weak:
       return try await getOrCreateWeakInstance(key: key, registration: registration)
@@ -359,21 +372,27 @@ actor ResolutionCoordinator: Resolver {
       if let disposable = instance as? Disposable {
         do {
           try await disposable.dispose()
-          await logger?.log(message: "🗑️ Container cached service disposed: \(key.description)", level: .debug)
+          await logger?.log(
+            message: "🗑️ Container cached service disposed: \(key.description)", level: .debug)
         } catch {
           await logger?.log(
-            message: "❌ Container cached service disposal failed: \(key.description) - \(error)", 
+            message: "❌ Container cached service disposal failed: \(key.description) - \(error)",
             level: .error
           )
         }
       }
     }
-    
+
     containerCache.removeAll()
     weakReferences.removeAll()
     ongoingCreations.values.forEach { $0.cancel() }
     ongoingCreations.removeAll()
     await cacheManager.clear()
+  }
+  
+  /// 등록 정보를 반환합니다 (우선순위 계산용)
+  func getRegistration(for key: AnyDependencyKey) -> DependencyRegistration? {
+    return registrations[key]
   }
 
   /// 캐시된 인스턴스를 반환합니다 (생명주기 이벤트 처리용)
@@ -475,45 +494,46 @@ actor ResolutionCoordinator: Resolver {
     key: AnyDependencyKey,
     registration: DependencyRegistration
   ) async throws -> any Sendable {
-    // 🚨 [RACE CONDITION ULTIMATE FIX] 
+    // 🚨 [RACE CONDITION ULTIMATE FIX]
     // 근본 원인: 체크와 셋 사이의 비원자적 간격
     // 해결책: 완전한 원자적 체크-앤-셋 패턴
-    
+
     // 원자적 체크-앤-셋: 한 번의 동기적 연산으로 처리
     if let cachedValue = containerCache[key] {
       return cachedValue
     }
-    
+
     if let existingTask = ongoingCreations[key] {
       return try await existingTask.value
     }
-    
+
     // 🔥 [CRITICAL] 여기서 Task 생성과 등록을 원자적으로 처리
     // 다른 태스크가 끼어들 수 없도록 보장
     let creationTask = Task<any Sendable, Error> {
       try await registration.factory(self)
     }
-    
+
     // 즉시 등록 - 이 시점에서 다른 태스크는 existingTask를 발견하게 됨
     ongoingCreations[key] = creationTask
 
     do {
       let instance = try await creationTask.value
-      
+
       // 성공 시 캐시에 저장하고 진행 중인 작업에서 제거
       containerCache[key] = instance
       ongoingCreations.removeValue(forKey: key)
-      
+
       return instance
     } catch {
       // 실패 시 진행 중인 작업에서 제거
       ongoingCreations.removeValue(forKey: key)
-      
+
       // 팩토리 에러를 WeaverError로 래핑
       if error is WeaverError {
         throw error
       } else {
-        throw WeaverError.resolutionFailed(.factoryFailed(keyName: key.description, underlying: error))
+        throw WeaverError.resolutionFailed(
+          .factoryFailed(keyName: key.description, underlying: error))
       }
     }
   }
@@ -523,7 +543,7 @@ actor ResolutionCoordinator: Resolver {
     registration: DependencyRegistration
   ) async throws -> any Sendable {
     // 🚨 [RACE CONDITION ULTIMATE FIX] 약한 참조도 동일한 패턴 적용
-    
+
     // 1. 기존 약한 참조 확인 및 정리
     if let weakBox = weakReferences[key] {
       if await weakBox.isAlive, let value = await weakBox.getValue() {
@@ -542,25 +562,26 @@ actor ResolutionCoordinator: Resolver {
     let creationTask = Task<any Sendable, Error> {
       try await registration.factory(self)
     }
-    
+
     ongoingCreations[key] = creationTask
 
     do {
       let instance = try await creationTask.value
-      
+
       // 약한 참조 설정
       try setupWeakReference(key: key, instance: instance)
       ongoingCreations.removeValue(forKey: key)
-      
+
       return instance
     } catch {
       ongoingCreations.removeValue(forKey: key)
-      
+
       // 팩토리 에러를 WeaverError로 래핑
       if error is WeaverError {
         throw error
       } else {
-        throw WeaverError.resolutionFailed(.factoryFailed(keyName: key.description, underlying: error))
+        throw WeaverError.resolutionFailed(
+          .factoryFailed(keyName: key.description, underlying: error))
       }
     }
   }
@@ -592,8 +613,6 @@ actor ResolutionCoordinator: Resolver {
   }
 }
 
-// 🚨 [REMOVED] ScopeManager - ResolutionCoordinator로 통합됨
-
 /// 앱 생명주기 이벤트만 담당하는 Actor
 actor ContainerLifecycleManager {
   private let logger: WeaverLogger?
@@ -611,11 +630,14 @@ actor ContainerLifecycleManager {
     await logger?.log(
       message: "📱 App entered background - shutting down services in reverse order", level: .info)
 
-    let appServiceKeys = registrations.filter { $1.scope == .appService }.map { $0.key }
+    let appServiceKeys = registrations.filter { 
+      // startup 스코프의 서비스들을 앱 서비스로 간주
+      $1.scope == .startup 
+    }.map { $0.key }
 
     // 🔧 [CRITICAL FIX] 백그라운드 진입 시 역순 처리
     // 네트워크 → 분석 → 설정 → 로깅 순서로 순차 종료
-    let prioritizedKeys = prioritizeAppServiceKeys(appServiceKeys)
+    let prioritizedKeys = prioritizeAppServiceKeys(appServiceKeys, registrations: registrations)
     let reversedKeys = Array(prioritizedKeys.reversed())
 
     for key in reversedKeys {
@@ -645,11 +667,14 @@ actor ContainerLifecycleManager {
       message: "📱 App will enter foreground - reactivating services in priority order", level: .info
     )
 
-    let appServiceKeys = registrations.filter { $1.scope == .appService }.map { $0.key }
+    let appServiceKeys = registrations.filter { 
+      // startup 스코프의 서비스들을 앱 서비스로 간주
+      $1.scope == .startup 
+    }.map { $0.key }
 
     // 🔧 [CRITICAL FIX] 포그라운드 복귀 시 정순 처리
     // 로깅 → 설정 → 분석 → 네트워크 순서로 순차 재활성화
-    let prioritizedKeys = prioritizeAppServiceKeys(appServiceKeys)
+    let prioritizedKeys = prioritizeAppServiceKeys(appServiceKeys, registrations: registrations)
 
     for key in prioritizedKeys {
       // 실제 인스턴스 접근 및 이벤트 전달
@@ -677,11 +702,14 @@ actor ContainerLifecycleManager {
     await logger?.log(
       message: "📱 App will terminate - shutting down services in LIFO order", level: .info)
 
-    let appServiceKeys = registrations.filter { $1.scope == .appService }.map { $0.key }
+    let appServiceKeys = registrations.filter { 
+      // startup 스코프의 서비스들을 앱 서비스로 간주
+      $1.scope == .startup 
+    }.map { $0.key }
 
     // 🔧 [CRITICAL FIX] 초기화 순서의 엄격한 역순으로 정리 (LIFO: Last In, First Out)
     // 네트워크 → 분석 → 설정 → 로깅 순서로 순차 종료하여 의존성 관계 보장
-    let prioritizedKeys = prioritizeAppServiceKeys(appServiceKeys)
+    let prioritizedKeys = prioritizeAppServiceKeys(appServiceKeys, registrations: registrations)
     let reversedKeys = Array(prioritizedKeys.reversed())
 
     await logger?.log(
@@ -727,74 +755,98 @@ actor ContainerLifecycleManager {
   }
 
   /// 앱 서비스의 초기화 우선순위를 결정합니다 (외부 접근용)
-  func prioritizeAppServiceKeys(_ keys: [AnyDependencyKey]) -> [AnyDependencyKey] {
+  func prioritizeAppServiceKeys(
+    _ keys: [AnyDependencyKey],
+    registrations: [AnyDependencyKey: DependencyRegistration]
+  ) -> [AnyDependencyKey] {
     return keys.sorted { lhs, rhs in
-      let lhsPriority = getAppServicePriority(for: lhs)
-      let rhsPriority = getAppServicePriority(for: rhs)
+      let lhsPriority = getAppServicePriority(for: lhs, registrations: registrations)
+      let rhsPriority = getAppServicePriority(for: rhs, registrations: registrations)
       return lhsPriority < rhsPriority
     }
   }
 
-  /// 🔧 [NEW] 외부에서 우선순위를 확인할 수 있는 메서드
-  func getAppServicePriority(for key: AnyDependencyKey) -> Int {
-    let keyName = key.description.lowercased()
-
-    // 🏗️ Layer 0: 기반 시스템 (Foundation Layer)
-    if keyName.contains("log") || keyName.contains("crash") || keyName.contains("debug") {
+  /// 확장 가능한 우선순위 시스템으로 서비스 초기화 순서를 결정합니다.
+  /// 스코프 기반 기본 우선순위 + 서비스명 기반 세밀한 조정을 지원합니다.
+  func getAppServicePriority(
+    for key: AnyDependencyKey,
+    registrations: [AnyDependencyKey: DependencyRegistration]
+  ) -> Int {
+    // 등록 정보에서 스코프를 기반으로 우선순위 결정
+    guard let registration = registrations[key] else {
+      return 999 // 등록되지 않은 키는 최하위 우선순위
+    }
+    
+    // 1. 스코프 기반 기본 우선순위 (100단위)
+    let basePriority = getScopePriority(registration.scope)
+    
+    // 2. 서비스명 기반 세밀한 조정 (10단위)
+    let servicePriority = getServiceSpecificPriority(key.description)
+    
+    // 3. 의존성 기반 추가 조정 (1단위)
+    let dependencyPriority = getDependencyBasedPriority(registration.dependencies)
+    
+    return basePriority + servicePriority + dependencyPriority
+  }
+  
+  /// 스코프별 기본 우선순위를 반환합니다.
+  private func getScopePriority(_ scope: Scope) -> Int {
+    switch scope {
+    case .startup:
+      return 0   // 최우선 - 앱 시작 시 필수 서비스
+    case .shared:
+      return 100 // 공유 서비스
+    case .whenNeeded:
+      return 200 // 필요시 로딩 서비스
+    case .weak:
+      return 300 // 약한 참조 서비스
+    }
+  }
+  
+  /// 서비스명 기반 세밀한 우선순위 조정을 반환합니다.
+  /// 복잡한 앱에서 특정 서비스의 초기화 순서를 미세 조정할 때 사용합니다.
+  private func getServiceSpecificPriority(_ serviceName: String) -> Int {
+    let lowercaseName = serviceName.lowercased()
+    
+    // 로깅 관련 서비스는 최우선
+    if lowercaseName.contains("logger") || lowercaseName.contains("log") {
       return 0
     }
-
-    // 🔧 Layer 1: 설정 및 환경 (Configuration Layer)
-    if keyName.contains("config") || keyName.contains("environment") || keyName.contains("setting")
-      || keyName.contains("preference") || keyName.contains("theme")
-    {
-      return 1
+    
+    // 설정 관련 서비스
+    if lowercaseName.contains("config") || lowercaseName.contains("setting") {
+      return 10
     }
-
-    // 📊 Layer 2: 분석 및 모니터링 (Analytics Layer)
-    if keyName.contains("analytics") || keyName.contains("tracker") || keyName.contains("metric")
-      || keyName.contains("telemetry") || keyName.contains("monitor")
-    {
-      return 2
+    
+    // 크래시 리포팅 서비스
+    if lowercaseName.contains("crash") || lowercaseName.contains("analytics") {
+      return 20
     }
-
-    // 🌐 Layer 3: 네트워크 및 외부 통신 (Network Layer)
-    if keyName.contains("network") || keyName.contains("api") || keyName.contains("client")
-      || keyName.contains("http") || keyName.contains("socket") || keyName.contains("sync")
-    {
-      return 3
+    
+    // 네트워크 관련 서비스
+    if lowercaseName.contains("network") || lowercaseName.contains("api") {
+      return 30
     }
-
-    // 🔐 Layer 4: 보안 및 인증 (Security Layer)
-    if keyName.contains("auth") || keyName.contains("security") || keyName.contains("keychain")
-      || keyName.contains("biometric") || keyName.contains("token")
-    {
-      return 4
+    
+    // 데이터베이스 관련 서비스
+    if lowercaseName.contains("database") || lowercaseName.contains("storage") {
+      return 40
     }
-
-    // 💾 Layer 5: 데이터 및 저장소 (Data Layer)
-    if keyName.contains("database") || keyName.contains("storage") || keyName.contains("cache")
-      || keyName.contains("persistence") || keyName.contains("core") && keyName.contains("data")
-    {
-      return 5
+    
+    // 인증 관련 서비스
+    if lowercaseName.contains("auth") || lowercaseName.contains("security") {
+      return 50
     }
-
-    // 🎯 Layer 6: 비즈니스 로직 및 기능 (Business Layer)
-    if keyName.contains("service") || keyName.contains("manager") || keyName.contains("controller")
-      || keyName.contains("handler") || keyName.contains("processor")
-    {
-      return 6
-    }
-
-    // 🎨 Layer 7: UI 및 프레젠테이션 (Presentation Layer)
-    if keyName.contains("ui") || keyName.contains("view") || keyName.contains("presentation")
-      || keyName.contains("coordinator") || keyName.contains("router")
-    {
-      return 7
-    }
-
-    // 🔧 Layer 8: 기타 앱 서비스 (Default Layer)
-    return 8
+    
+    // 기타 서비스
+    return 60
+  }
+  
+  /// 의존성 개수 기반 추가 우선순위 조정을 반환합니다.
+  /// 의존성이 적은 서비스일수록 먼저 초기화됩니다.
+  private func getDependencyBasedPriority(_ dependencies: [String]) -> Int {
+    // 의존성이 많을수록 나중에 초기화 (최대 9까지)
+    return min(dependencies.count, 9)
   }
 
   func shutdown() async {
@@ -803,8 +855,6 @@ actor ContainerLifecycleManager {
 }
 
 // MARK: - ==================== Support Types ====================
-
-// 🚨 [REMOVED] ResolutionEngineWrapper - ResolutionCoordinator가 직접 Resolver 구현
 
 struct ScopeMetrics {
   let cacheHits: Int
@@ -816,47 +866,33 @@ struct ScopeMetrics {
 // MARK: - ==================== 핵심 타입 정의 ====================
 
 /// 의존성의 생명주기를 정의하는 스코프 타입입니다.
-/// 인스턴스가 언제까지 살아있을지를 결정합니다.
+/// 사용자 관점에서 직관적이고 명확한 4가지 스코프를 제공합니다.
 public enum Scope: String, Sendable {
-  /// 컨테이너 생명주기 동안 단일 인스턴스 유지 (일반적인 싱글톤)
-  case container
+  /// 앱 전체에서 하나의 인스턴스를 공유합니다 (싱글톤)
+  /// 로깅, 설정, 네트워크 서비스 등에 사용
+  case shared
 
-  /// 약한 참조로 관리되어 메모리 누수 방지
+  /// 약한 참조로 관리되어 메모리 누수를 방지합니다
+  /// 델리게이트, 옵저버 패턴 등에 사용
   case weak
 
-  /// 캐시 정책에 따라 관리 (메모리 압박시 해제 가능)
-  case cached
+  /// 앱 시작 시 미리 로딩되는 필수 서비스입니다
+  /// 로깅, 크래시 리포팅, 기본 설정 등에 사용
+  case startup
 
-  /// 앱 전체 핵심 서비스 (앱 생명주기 이벤트 수신)
-  case appService
-
-  /// 부트스트랩 레이어 (필수 시스템 서비스)
-  case bootstrap
-
-  /// 코어 레이어 (메인 화면 표시용)
-  case core
-
-  /// 피처 레이어 (기능별 서비스)
-  case feature
+  /// 실제 사용할 때만 로딩되는 기능별 서비스입니다
+  /// 카메라, 결제, 위치 서비스 등에 사용
+  case whenNeeded
 }
 
-/// 의존성의 초기화 시점을 정의하는 열거형입니다.
-/// 언제 인스턴스를 생성할지를 결정합니다.
-public enum InitializationTiming: String, Sendable, CaseIterable {
-  /// 앱 시작과 함께 백그라운드에서 초기화 (중요 서비스)
-  /// 로깅, 크래시 리포팅, 분석, 네트워크 모니터 등
+/// 의존성의 초기화 시점을 정의하는 내부 열거형입니다.
+/// 스코프에 따라 자동으로 결정되므로 사용자가 직접 지정할 필요가 없습니다.
+internal enum InitializationTiming: String, Sendable, CaseIterable {
+  /// 앱 시작과 함께 즉시 초기화
   case eager
 
-  /// 메인 화면 표시를 위해 백그라운드에서 초기화 (일반 서비스)
-  /// 사용자 세션, 설정, 테마 등
-  case background
-
-  /// 실제 사용할 때만 초기화 (기능별 서비스) - 기본값
-  /// 카메라, 결제, 위치, 소셜 공유 등
+  /// 실제 사용할 때만 초기화 (기본값)
   case onDemand
-
-  /// 지연 초기화 (레거시 호환성)
-  case lazy
 }
 
 /// `DependencyKey`의 타입 정보를 타입 소거 형태로 감싸는 구조체입니다.
@@ -877,23 +913,32 @@ public struct AnyDependencyKey: Hashable, CustomStringConvertible, Sendable {
 /// 의존성 등록 정보를 담는 구조체입니다.
 public struct DependencyRegistration: Sendable {
   public let scope: Scope
-  public let timing: InitializationTiming
+  internal let timing: InitializationTiming  // internal로 변경
   public let factory: @Sendable (Resolver) async throws -> any Sendable
   public let keyName: String
   public let dependencies: [String]
 
   public init(
     scope: Scope,
-    timing: InitializationTiming = .lazy,
     factory: @escaping @Sendable (Resolver) async throws -> any Sendable,
     keyName: String,
     dependencies: [String] = []
   ) {
     self.scope = scope
-    self.timing = timing
+    self.timing = Self.getTimingForScope(scope)
     self.factory = factory
     self.keyName = keyName
     self.dependencies = dependencies
+  }
+  
+  /// 스코프에 따라 최적의 초기화 시점을 자동으로 결정합니다.
+  private static func getTimingForScope(_ scope: Scope) -> InitializationTiming {
+    switch scope {
+    case .startup:
+      return .eager      // 앱 시작 시 즉시 로딩
+    case .shared, .weak, .whenNeeded:
+      return .onDemand   // 필요할 때 로딩
+    }
   }
 }
 
@@ -928,11 +973,7 @@ public struct ResolutionMetrics: Sendable, CustomStringConvertible {
   }
 }
 
-// 🚨 [REMOVED] ContainerConfiguration은 WeaverBuilder에서 관리됨
-// 중복 정의 방지를 위해 제거
 
-// 🚨 [REMOVED] CachePolicy는 WeaverKernel.swift에 정의됨
-// 중복 선언 방지를 위해 제거
 
 // MARK: - ==================== Default Implementations ====================
 
@@ -1061,8 +1102,7 @@ public struct WeakReferenceMetrics: Sendable {
   }
 }
 
-// 🚨 [REMOVED] AppLifecycleAware와 Disposable 프로토콜은 WeaverKernel.swift에 정의됨
-// 중복 선언 방지를 위해 제거
+
 
 // MARK: - ==================== ResolutionCoordinator 확장 ====================
 
@@ -1118,4 +1158,95 @@ extension WeaverContainer {
       throw error
     }
   }
+}
+
+// MARK: - ==================== 확장 가능한 우선순위 시스템 ====================
+
+/// 커스텀 우선순위 로직을 제공하기 위한 프로토콜입니다.
+/// 복잡한 앱에서 특별한 초기화 순서가 필요한 경우 구현하여 사용할 수 있습니다.
+public protocol ServicePriorityProvider: Sendable {
+    /// 주어진 서비스 키와 등록 정보를 기반으로 우선순위를 계산합니다.
+    /// - Parameters:
+    ///   - key: 서비스 키
+    ///   - registration: 서비스 등록 정보
+    /// - Returns: 우선순위 값 (낮을수록 먼저 초기화)
+    func getPriority(for key: AnyDependencyKey, registration: DependencyRegistration) async -> Int
+}
+
+/// 기본 우선순위 제공자 구현
+public struct DefaultServicePriorityProvider: ServicePriorityProvider {
+    public init() {}
+    
+    public func getPriority(for key: AnyDependencyKey, registration: DependencyRegistration) async -> Int {
+        let basePriority = getScopePriority(registration.scope)
+        let servicePriority = getServiceSpecificPriority(key.description)
+        let dependencyPriority = getDependencyBasedPriority(registration.dependencies)
+        
+        return basePriority + servicePriority + dependencyPriority
+    }
+    
+    private func getScopePriority(_ scope: Scope) -> Int {
+        switch scope {
+        case .startup: return 0
+        case .shared: return 100
+        case .whenNeeded: return 200
+        case .weak: return 300
+        }
+    }
+    
+    private func getServiceSpecificPriority(_ serviceName: String) -> Int {
+        let lowercaseName = serviceName.lowercased()
+        
+        if lowercaseName.contains("logger") || lowercaseName.contains("log") { return 0 }
+        if lowercaseName.contains("config") || lowercaseName.contains("setting") { return 10 }
+        if lowercaseName.contains("crash") || lowercaseName.contains("analytics") { return 20 }
+        if lowercaseName.contains("network") || lowercaseName.contains("api") { return 30 }
+        if lowercaseName.contains("database") || lowercaseName.contains("storage") { return 40 }
+        if lowercaseName.contains("auth") || lowercaseName.contains("security") { return 50 }
+        
+        return 60
+    }
+    
+    private func getDependencyBasedPriority(_ dependencies: [String]) -> Int {
+        return min(dependencies.count, 9)
+    }
+}
+
+/// 커스텀 우선순위 제공자를 사용하는 예시
+public struct CustomServicePriorityProvider: ServicePriorityProvider {
+    private let customPriorities: [String: Int]
+    private let fallbackProvider: ServicePriorityProvider
+    
+    public init(
+        customPriorities: [String: Int] = [:],
+        fallbackProvider: ServicePriorityProvider = DefaultServicePriorityProvider()
+    ) {
+        self.customPriorities = customPriorities
+        self.fallbackProvider = fallbackProvider
+    }
+    
+    public func getPriority(for key: AnyDependencyKey, registration: DependencyRegistration) async -> Int {
+        // 커스텀 우선순위가 있으면 사용
+        if let customPriority = customPriorities[key.description] {
+            return customPriority
+        }
+        
+        // 없으면 기본 제공자에 위임
+        return await fallbackProvider.getPriority(for: key, registration: registration)
+    }
+}
+
+extension ContainerLifecycleManager {
+    /// 커스텀 우선순위 제공자를 사용하여 서비스 우선순위를 계산합니다.
+    func getAppServicePriority(
+        for key: AnyDependencyKey,
+        registrations: [AnyDependencyKey: DependencyRegistration],
+        priorityProvider: ServicePriorityProvider = DefaultServicePriorityProvider()
+    ) async -> Int {
+        guard let registration = registrations[key] else {
+            return 999 // 등록되지 않은 키는 최하위 우선순위
+        }
+        
+        return await priorityProvider.getPriority(for: key, registration: registration)
+    }
 }
