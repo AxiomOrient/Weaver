@@ -57,6 +57,7 @@ public final class WeaverSyncContainer: Sendable {
   public func resolve<Key: DependencyKey>(_ keyType: Key.Type) async throws -> Key.Value {
     let key = AnyDependencyKey(keyType)
 
+    // 🚨 [RACE CONDITION FIX] 원자적 체크-앤-셋 패턴 적용
     // 캐시된 인스턴스 확인
     if let cached = instanceCache.withLock({ cache in
       return cache[key]
@@ -64,75 +65,45 @@ public final class WeaverSyncContainer: Sendable {
       return cached
     }
 
-    // 진행 중인 생성 작업 확인
-    let existingTask = creationTasks.withLock { tasks in
-      return tasks[key]
-    }
-
-    if let task = existingTask {
-      let instance = try await task.value
-      guard let typedInstance = instance as? Key.Value else {
-        throw WeaverError.resolutionFailed(
-          .typeMismatch(
-            expected: "\(Key.Value.self)",
-            actual: "\(type(of: instance))",
-            keyName: key.description
-          ))
-      }
-      return typedInstance
-    }
-
-    // 새로운 인스턴스 생성
-    return try await createInstance(key: key, keyType: keyType)
-  }
-
-  /// 안전한 의존성 해결 - 실패시 기본값을 반환합니다.
-  public func safeResolve<Key: DependencyKey>(_ keyType: Key.Type) async -> Key.Value {
-    do {
-      return try await resolve(keyType)
-    } catch {
-      return Key.defaultValue
-    }
-  }
-
-  // MARK: - Private Implementation
-
-  private func createInstance<Key: DependencyKey>(
-    key: AnyDependencyKey,
-    keyType: Key.Type
-  ) async throws -> Key.Value {
-
+    // 등록 확인
     guard let registration = registrations[key] else {
       throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
     }
 
-    // 생성 작업 등록
-    let creationTask = Task<any Sendable, Error> {
-      let instance = try await registration.factory(self)
-
-      // 캐시에 저장 (scope에 따라)
-      switch registration.scope {
-      case .container, .cached:
-        instanceCache.withLock { cache in
-          cache[key] = instance
-        }
-      case .weak:
-        // 약한 참조는 별도 처리 필요
-        break
-      default:
-        break
+    // 진행 중인 생성 작업 확인 및 새 작업 생성을 원자적으로 처리
+    let task = creationTasks.withLock { tasks in
+      // 기존 작업이 있으면 반환
+      if let existingTask = tasks[key] {
+        return existingTask
       }
+      
+      // 새 작업 생성 및 즉시 등록 (원자적)
+      let creationTask = Task<any Sendable, Error> {
+        let instance = try await registration.factory(self)
 
-      return instance
-    }
+        // 캐시에 저장 (scope에 따라)
+        switch registration.scope {
+        case .container, .cached:
+          instanceCache.withLock { cache in
+            cache[key] = instance
+          }
+        case .weak:
+          // 약한 참조는 별도 처리 필요
+          break
+        default:
+          break
+        }
 
-    // 진행 중인 작업으로 등록
-    creationTasks.withLock { tasks in
+        return instance
+      }
+      
+      // 즉시 등록하여 다른 스레드의 중복 생성 방지
       tasks[key] = creationTask
+      return creationTask
     }
 
     do {
-      let instance = try await creationTask.value
+      let instance = try await task.value
 
       // 완료된 작업 제거
       creationTasks.withLock { tasks in
@@ -147,17 +118,27 @@ public final class WeaverSyncContainer: Sendable {
             keyName: key.description
           ))
       }
-
       return typedInstance
-
     } catch {
-      // 실패한 작업 제거
+      // 실패 시 작업 제거
       creationTasks.withLock { tasks in
         _ = tasks.removeValue(forKey: key)
       }
       throw error
     }
   }
+
+  /// 안전한 의존성 해결 - 실패시 기본값을 반환합니다.
+  public func safeResolve<Key: DependencyKey>(_ keyType: Key.Type) async -> Key.Value {
+    do {
+      return try await resolve(keyType)
+    } catch {
+      return Key.defaultValue
+    }
+  }
+
+  // MARK: - Private Implementation
+  // createInstance 메서드는 resolve 메서드로 통합되어 제거됨
 }
 
 // MARK: - ==================== 동기적 빌더 ====================

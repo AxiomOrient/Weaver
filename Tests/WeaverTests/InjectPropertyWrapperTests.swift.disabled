@@ -217,7 +217,7 @@ struct InjectPropertyWrapperTests {
             let modules = [AnonymousModule { builder in
                 await builder.register(ServiceProtocolKey.self) { _ in TestService(isDefaultValue: false) }
             }]
-            let kernel = DefaultWeaverKernel(modules: modules)
+            let kernel = WeaverKernel(modules: modules)
             await isolatedState.setGlobalKernel(kernel)
             // 주의: kernel.build()를 호출하지 않아서 idle 상태 유지
             

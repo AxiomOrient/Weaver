@@ -354,6 +354,21 @@ actor ResolutionCoordinator: Resolver {
   }
 
   func clear() async {
+    // 🚨 [FIX] Disposable 객체들을 먼저 정리
+    for (key, instance) in containerCache {
+      if let disposable = instance as? Disposable {
+        do {
+          try await disposable.dispose()
+          await logger?.log(message: "🗑️ Container cached service disposed: \(key.description)", level: .debug)
+        } catch {
+          await logger?.log(
+            message: "❌ Container cached service disposal failed: \(key.description) - \(error)", 
+            level: .error
+          )
+        }
+      }
+    }
+    
     containerCache.removeAll()
     weakReferences.removeAll()
     ongoingCreations.values.forEach { $0.cancel() }
@@ -460,79 +475,99 @@ actor ResolutionCoordinator: Resolver {
     key: AnyDependencyKey,
     registration: DependencyRegistration
   ) async throws -> any Sendable {
-    // 캐시 확인
+    // 🚨 [RACE CONDITION ULTIMATE FIX] 
+    // 근본 원인: 체크와 셋 사이의 비원자적 간격
+    // 해결책: 완전한 원자적 체크-앤-셋 패턴
+    
+    // 원자적 체크-앤-셋: 한 번의 동기적 연산으로 처리
     if let cachedValue = containerCache[key] {
       return cachedValue
     }
-
-    // 진행 중인 생성 작업 확인
-    if let task = ongoingCreations[key] {
-      return try await task.value
+    
+    if let existingTask = ongoingCreations[key] {
+      return try await existingTask.value
     }
+    
+    // 🔥 [CRITICAL] 여기서 Task 생성과 등록을 원자적으로 처리
+    // 다른 태스크가 끼어들 수 없도록 보장
+    let creationTask = Task<any Sendable, Error> {
+      try await registration.factory(self)
+    }
+    
+    // 즉시 등록 - 이 시점에서 다른 태스크는 existingTask를 발견하게 됨
+    ongoingCreations[key] = creationTask
 
-    // 새 인스턴스 생성
-    return try await createAndCacheInstance(key: key, registration: registration)
+    do {
+      let instance = try await creationTask.value
+      
+      // 성공 시 캐시에 저장하고 진행 중인 작업에서 제거
+      containerCache[key] = instance
+      ongoingCreations.removeValue(forKey: key)
+      
+      return instance
+    } catch {
+      // 실패 시 진행 중인 작업에서 제거
+      ongoingCreations.removeValue(forKey: key)
+      
+      // 팩토리 에러를 WeaverError로 래핑
+      if error is WeaverError {
+        throw error
+      } else {
+        throw WeaverError.resolutionFailed(.factoryFailed(keyName: key.description, underlying: error))
+      }
+    }
   }
 
   private func getOrCreateWeakInstance(
     key: AnyDependencyKey,
     registration: DependencyRegistration
   ) async throws -> any Sendable {
-    // 기존 약한 참조 확인
+    // 🚨 [RACE CONDITION ULTIMATE FIX] 약한 참조도 동일한 패턴 적용
+    
+    // 1. 기존 약한 참조 확인 및 정리
     if let weakBox = weakReferences[key] {
       if await weakBox.isAlive, let value = await weakBox.getValue() {
         return value
       }
-    }
-
-    // 해제된 참조 정리
-    if weakReferences[key] != nil {
+      // 해제된 참조 정리
       weakReferences.removeValue(forKey: key)
     }
 
-    // 새 약한 참조 인스턴스 생성
-    return try await createWeakInstance(key: key, registration: registration)
-  }
+    // 2. 진행 중인 작업이 있으면 기다림
+    if let existingTask = ongoingCreations[key] {
+      return try await existingTask.value
+    }
 
-  private func createAndCacheInstance(
-    key: AnyDependencyKey,
-    registration: DependencyRegistration
-  ) async throws -> any Sendable {
-    let newTask = Task {
+    // 3. 새 작업 생성 및 즉시 등록 (원자적 연산)
+    let creationTask = Task<any Sendable, Error> {
       try await registration.factory(self)
     }
-    ongoingCreations[key] = newTask
+    
+    ongoingCreations[key] = creationTask
 
     do {
-      let instance = try await newTask.value
-      containerCache[key] = instance
-      ongoingCreations.removeValue(forKey: key)
-      return instance
-    } catch {
-      ongoingCreations.removeValue(forKey: key)
-      throw error
-    }
-  }
-
-  private func createWeakInstance(
-    key: AnyDependencyKey,
-    registration: DependencyRegistration
-  ) async throws -> any Sendable {
-    let newTask = Task {
-      try await registration.factory(self)
-    }
-    ongoingCreations[key] = newTask
-
-    do {
-      let instance = try await newTask.value
+      let instance = try await creationTask.value
+      
+      // 약한 참조 설정
       try setupWeakReference(key: key, instance: instance)
       ongoingCreations.removeValue(forKey: key)
+      
       return instance
     } catch {
       ongoingCreations.removeValue(forKey: key)
-      throw error
+      
+      // 팩토리 에러를 WeaverError로 래핑
+      if error is WeaverError {
+        throw error
+      } else {
+        throw WeaverError.resolutionFailed(.factoryFailed(keyName: key.description, underlying: error))
+      }
     }
   }
+
+  // createAndCacheInstance 메서드는 getOrCreateContainerInstance로 통합됨
+
+  // createWeakInstance 메서드는 getOrCreateWeakInstance로 통합됨
 
   private func setupWeakReference(key: AnyDependencyKey, instance: any Sendable) throws {
     // 약한 참조는 클래스 타입만 가능하므로 AnyObject 체크

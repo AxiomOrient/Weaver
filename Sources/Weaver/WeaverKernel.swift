@@ -125,6 +125,11 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             return resolver
         }
         
+        // shutdown 상태인 경우
+        if case .shutdown = _currentState {
+            throw WeaverError.shutdownInProgress
+        }
+        
         // realistic 전략의 경우 syncContainer 즉시 반환
         if initializationStrategy == .realistic, let syncContainer = syncContainer {
             return syncContainer

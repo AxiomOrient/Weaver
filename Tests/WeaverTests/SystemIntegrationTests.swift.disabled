@@ -1,0 +1,591 @@
+import Testing
+import Foundation
+@testable import Weaver
+
+// MARK: - 시스템 통합 테스트
+
+@Suite("System Integration - 전체 시스템 통합 검증")
+struct SystemIntegrationTests {
+    
+    // MARK: - 실제 앱 시나리오 시뮬레이션
+    
+    @Test("완전한 앱 생명주기 시뮬레이션")
+    func testCompleteAppLifecycleSimulation() async throws {
+        // 1. 앱 시작 - 모듈 정의
+        let modules = [
+            LoggingModule(),      // Layer 0: 로깅
+            ConfigModule(),       // Layer 1: 설정
+            AnalyticsModule(),    // Layer 2: 분석
+            NetworkModule(),      // Layer 3: 네트워크
+            SecurityModule(),     // Layer 4: 보안
+            DataModule(),         // Layer 5: 데이터
+            BusinessModule(),     // Layer 6: 비즈니스
+            UIModule()           // Layer 7: UI
+        ]
+        
+        // 2. 커널 생성 및 전역 설정
+        let kernel = WeaverKernel(modules: modules, strategy: .realistic)
+        await Weaver.setGlobalKernel(kernel)
+        
+        // 3. 앱 빌드 (즉시 사용 가능)
+        await kernel.build()
+        
+        // 4. 즉시 핵심 서비스 사용 가능 검증
+        @Inject(LoggerServiceKey.self) var logger
+        @Inject(ConfigServiceKey.self) var config
+        
+        let log = await logger()
+        let configuration = await config()
+        
+        #expect(log != nil)
+        #expect(configuration != nil)
+        
+        // 5. 백그라운드 초기화 완료 대기
+        _ = try await kernel.waitForReady(timeout: nil)
+        
+        // 6. 모든 계층 서비스 사용 가능 검증
+        @Inject(NetworkServiceKey.self) var network
+        @Inject(SecurityServiceKey.self) var security
+        @Inject(DataServiceKey.self) var data
+        @Inject(BusinessServiceKey.self) var business
+        @Inject(UIServiceKey.self) var ui
+        
+        let networkService = await network()
+        let securityService = await security()
+        let dataService = await data()
+        let businessService = await business()
+        let uiService = await ui()
+        
+        #expect(networkService != nil)
+        #expect(securityService != nil)
+        #expect(dataService != nil)
+        #expect(businessService != nil)
+        #expect(uiService != nil)
+        
+        // 7. 앱 생명주기 이벤트 시뮬레이션
+        await Weaver.handleAppLifecycleEvent(.didEnterBackground)
+        await Weaver.handleAppLifecycleEvent(.willEnterForeground)
+        
+        // 8. 정리
+        await kernel.shutdown()
+        await Weaver.setGlobalKernel(nil)
+    }
+    
+    @Test("대규모 의존성 그래프 처리")
+    func testLargeScaleDependencyGraph() async throws {
+        let builder = WeaverContainer.builder()
+        
+        // 100개의 서로 다른 의존성 등록
+        for i in 0..<100 {
+            await builder.register(DynamicServiceKey(id: i).self) { _ in
+                DynamicService(id: i)
+            }
+        }
+        
+        // 의존성 체인 생성 (각 서비스가 이전 서비스에 의존)
+        for i in 1..<50 {
+            await builder.register(ChainedServiceKey(id: i).self) { resolver in
+                let dependency = try await resolver.resolve(ChainedServiceKey(id: i-1).self)
+                return ChainedService(id: i, dependency: dependency)
+            }
+        }
+        
+        let container = await builder.build()
+        
+        // 성능 측정
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        // 모든 독립 서비스 해결
+        for i in 0..<100 {
+            _ = try await container.resolve(DynamicServiceKey(id: i).self)
+        }
+        
+        // 체인 끝 서비스 해결 (전체 체인 초기화)
+        let chainEnd = try await container.resolve(ChainedServiceKey(id: 49).self)
+        #expect(chainEnd.id == 49)
+        #expect(chainEnd.dependency?.id == 48)
+        
+        let duration = CFAbsoluteTimeGetCurrent() - startTime
+        print("🚀 대규모 의존성 그래프 처리 시간: \(String(format: "%.3f", duration))초")
+        
+        #expect(duration < 1.0, "대규모 의존성 그래프 처리가 1초를 초과합니다")
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - 동시성 스트레스 테스트
+    
+    @Test("극한 동시성 스트레스 테스트")
+    func testExtremeConcurrencyStress() async throws {
+        let container = await WeaverContainer.builder()
+            .register(ServiceKey.self, scope: .container) { _ in
+                // 의도적인 지연으로 경쟁 조건 유도
+                try await Task.sleep(nanoseconds: 1_000_000) // 1ms
+                return TestService()
+            }
+            .register(TransientServiceKey.self) { _ in
+                return TestService()
+            }
+            .build()
+        
+        let concurrentTasks = 1000
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        // 1000개 동시 요청
+        try await withThrowingTaskGroup(of: (Service, Service).self) { group in
+            for _ in 0..<concurrentTasks {
+                group.addTask {
+                    async let containerScoped = container.resolve(ServiceKey.self)
+                    async let transient = container.resolve(TransientServiceKey.self)
+                    return try await (containerScoped, transient)
+                }
+            }
+            
+            var containerScopedIds: Set<UUID> = []
+            var transientIds: Set<UUID> = []
+            
+            for try await (containerScoped, transient) in group {
+                containerScopedIds.insert(containerScoped.id)
+                transientIds.insert(transient.id)
+            }
+            
+            // Container 스코프는 모두 동일한 인스턴스
+            #expect(containerScopedIds.count == 1)
+            
+            // Transient는 각각 다른 인스턴스일 수 있음
+            print("🔄 Container 스코프 인스턴스 수: \(containerScopedIds.count)")
+            print("🔄 Transient 인스턴스 수: \(transientIds.count)")
+        }
+        
+        let duration = CFAbsoluteTimeGetCurrent() - startTime
+        print("⚡ 극한 동시성 테스트 완료 시간: \(String(format: "%.3f", duration))초")
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - 메모리 압박 시나리오
+    
+    @Test("메모리 압박 상황 복구 테스트")
+    func testMemoryPressureRecovery() async throws {
+        let container = await WeaverContainer.builder()
+            .registerWeak(WeakServiceKey.self) { _ in WeakService() }
+            .register(ServiceKey.self, scope: .cached) { _ in TestService() }
+            .build()
+        
+        // 대량 인스턴스 생성으로 메모리 압박 유도
+        var weakInstances: [WeakService] = []
+        var regularInstances: [Service] = []
+        
+        for _ in 0..<5000 {
+            let weakInstance = try await container.resolve(WeakServiceKey.self)
+            let regularInstance = try await container.resolve(ServiceKey.self)
+            
+            weakInstances.append(weakInstance)
+            regularInstances.append(regularInstance)
+        }
+        
+        // 메모리 사용량 확인
+        let initialMetrics = await container.getMetrics()
+        print("📊 초기 메트릭: \(initialMetrics)")
+        
+        // 참조 해제
+        weakInstances.removeAll()
+        regularInstances.removeAll()
+        
+        // 가비지 컬렉션 유도
+        for _ in 0..<20 {
+            _ = Array(0..<10000).map { _ in UUID() }
+        }
+        
+        // 강제 메모리 정리
+        await container.performMemoryCleanup(forced: true)
+        
+        // 정리 후 메트릭 확인
+        let finalMetrics = await container.getMetrics()
+        print("📊 정리 후 메트릭: \(finalMetrics)")
+        
+        #expect(finalMetrics.weakReferences.deallocatedWeakReferences >= 0)
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - 에러 복구 시나리오
+    
+    @Test("부분 실패 상황에서 시스템 복구")
+    func testPartialFailureRecovery() async throws {
+        let container = await WeaverContainer.builder()
+            .register(ReliableServiceKey.self) { _ in ReliableService() }
+            .register(UnreliableServiceKey.self) { _ in
+                // 50% 확률로 실패
+                if Bool.random() {
+                    throw TestError.factoryFailed
+                }
+                return UnreliableService()
+            }
+            .register(DependentServiceKey.self) { resolver in
+                let reliable = try await resolver.resolve(ReliableServiceKey.self)
+                
+                // 불안정한 서비스는 안전하게 처리
+                let unreliable: UnreliableService?
+                do {
+                    unreliable = try await resolver.resolve(UnreliableServiceKey.self)
+                } catch {
+                    unreliable = nil // 실패해도 계속 진행
+                }
+                
+                return DependentService(reliable: reliable, unreliable: unreliable)
+            }
+            .build()
+        
+        var successCount = 0
+        var partialSuccessCount = 0
+        
+        // 100번 시도
+        for _ in 0..<100 {
+            do {
+                let service = try await container.resolve(DependentServiceKey.self)
+                if service.unreliable != nil {
+                    successCount += 1
+                } else {
+                    partialSuccessCount += 1
+                }
+            } catch {
+                // 완전 실패는 없어야 함 (reliable 서비스는 항상 성공)
+                #expect(Bool(false), "예상치 못한 완전 실패: \(error)")
+            }
+        }
+        
+        print("✅ 완전 성공: \(successCount)회")
+        print("⚠️ 부분 성공: \(partialSuccessCount)회")
+        
+        #expect(successCount + partialSuccessCount == 100)
+        #expect(partialSuccessCount > 0, "부분 실패 시나리오가 발생하지 않음")
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - 성능 벤치마크
+    
+    @Test("전체 시스템 성능 벤치마크")
+    func benchmarkOverallSystemPerformance() async throws {
+        let monitor = WeaverPerformanceMonitor(enabled: true)
+        
+        // 복잡한 의존성 그래프 구성
+        let container = await WeaverContainer.builder()
+            .register(Layer0ServiceKey.self, scope: .container) { _ in Layer0Service() }
+            .register(Layer1ServiceKey.self, scope: .container) { resolver in
+                let layer0 = try await resolver.resolve(Layer0ServiceKey.self)
+                return Layer1Service(dependency: layer0)
+            }
+            .register(Layer2ServiceKey.self, scope: .container) { resolver in
+                let layer1 = try await resolver.resolve(Layer1ServiceKey.self)
+                return Layer2Service(dependency: layer1)
+            }
+            .register(Layer3ServiceKey.self, scope: .container) { resolver in
+                let layer2 = try await resolver.resolve(Layer2ServiceKey.self)
+                return Layer3Service(dependency: layer2)
+            }
+            .build()
+        
+        let iterations = 1000
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        // 벤치마크 실행
+        for i in 0..<iterations {
+            _ = await monitor.measureResolution(keyName: "Layer3Service\(i)") {
+                try await container.resolve(Layer3ServiceKey.self)
+            }
+            
+            if i % 100 == 0 {
+                await monitor.recordMemoryUsage()
+            }
+        }
+        
+        let totalDuration = CFAbsoluteTimeGetCurrent() - startTime
+        let report = await monitor.generatePerformanceReport()
+        
+        print("🏆 전체 시스템 성능 벤치마크:")
+        print("- 총 해결 횟수: \(iterations)")
+        print("- 총 소요 시간: \(String(format: "%.3f", totalDuration))초")
+        print("- 평균 해결 시간: \(String(format: "%.3f", report.averageResolutionTime * 1000))ms")
+        print("- 느린 해결 횟수: \(report.slowResolutions.count)")
+        print("- 평균 메모리 사용량: \(report.averageMemoryUsage / (1024*1024))MB")
+        print("- 최대 메모리 사용량: \(report.peakMemoryUsage / (1024*1024))MB")
+        
+        // 성능 기준 검증
+        #expect(report.averageResolutionTime < 0.001, "평균 해결 시간이 1ms를 초과합니다")
+        #expect(report.slowResolutions.count < iterations * 0.05, "느린 해결이 5%를 초과합니다")
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - 플랫폼 호환성 검증
+    
+    @Test("크로스 플랫폼 호환성 검증")
+    func testCrossPlatformCompatibility() async throws {
+        // PlatformAppropriateLock 동작 확인
+        let lock = PlatformAppropriateLock(initialState: 0)
+        let lockInfo = lock.lockMechanismInfo
+        
+        print("🔒 플랫폼 잠금 메커니즘: \(lockInfo)")
+        
+        // 동기 컨테이너 iOS 15/16 호환성
+        let syncContainer = WeaverSyncContainer.builder()
+            .register(ServiceKey.self) { _ in TestService() }
+            .build()
+        
+        let service = try await syncContainer.resolve(ServiceKey.self)
+        #expect(service.isDefaultValue == false)
+        
+        // 비동기 컨테이너 호환성
+        let asyncContainer = await WeaverContainer.builder()
+            .register(ServiceKey.self) { _ in TestService() }
+            .build()
+        
+        let asyncService = try await asyncContainer.resolve(ServiceKey.self)
+        #expect(asyncService.isDefaultValue == false)
+        
+        await asyncContainer.shutdown()
+    }
+}
+
+// MARK: - 테스트 지원 타입들
+
+extension SystemIntegrationTests {
+    
+    // 8계층 모듈 정의
+    struct LoggingModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(LoggerServiceKey.self, scope: .appService) { _ in
+                LoggerService()
+            }
+        }
+    }
+    
+    struct ConfigModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(ConfigServiceKey.self, scope: .appService) { _ in
+                ConfigService()
+            }
+        }
+    }
+    
+    struct AnalyticsModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(AnalyticsServiceKey.self, scope: .appService) { _ in
+                AnalyticsService()
+            }
+        }
+    }
+    
+    struct NetworkModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(NetworkServiceKey.self, scope: .appService) { _ in
+                NetworkService()
+            }
+        }
+    }
+    
+    struct SecurityModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(SecurityServiceKey.self, scope: .appService) { _ in
+                SecurityService()
+            }
+        }
+    }
+    
+    struct DataModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(DataServiceKey.self, scope: .appService) { _ in
+                DataService()
+            }
+        }
+    }
+    
+    struct BusinessModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(BusinessServiceKey.self, scope: .appService) { _ in
+                BusinessService()
+            }
+        }
+    }
+    
+    struct UIModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(UIServiceKey.self, scope: .appService) { _ in
+                UIService()
+            }
+        }
+    }
+    
+    // DependencyKey 정의들
+    struct ServiceKey: DependencyKey {
+        typealias Value = Service
+        static var defaultValue: Service { NullService(isDefaultValue: true) }
+    }
+    
+    struct TransientServiceKey: DependencyKey {
+        typealias Value = Service
+        static var defaultValue: Service { NullService(isDefaultValue: true) }
+    }
+    
+    struct WeakServiceKey: DependencyKey {
+        typealias Value = WeakService
+        static var defaultValue: WeakService { WeakService(isDefaultValue: true) }
+    }
+    
+    // 8계층 서비스 키들
+    struct LoggerServiceKey: DependencyKey {
+        typealias Value = LoggerService
+        static var defaultValue: LoggerService { LoggerService() }
+    }
+    
+    struct ConfigServiceKey: DependencyKey {
+        typealias Value = ConfigService
+        static var defaultValue: ConfigService { ConfigService() }
+    }
+    
+    struct AnalyticsServiceKey: DependencyKey {
+        typealias Value = AnalyticsService
+        static var defaultValue: AnalyticsService { AnalyticsService() }
+    }
+    
+    struct NetworkServiceKey: DependencyKey {
+        typealias Value = NetworkService
+        static var defaultValue: NetworkService { NetworkService() }
+    }
+    
+    struct SecurityServiceKey: DependencyKey {
+        typealias Value = SecurityService
+        static var defaultValue: SecurityService { SecurityService() }
+    }
+    
+    struct DataServiceKey: DependencyKey {
+        typealias Value = DataService
+        static var defaultValue: DataService { DataService() }
+    }
+    
+    struct BusinessServiceKey: DependencyKey {
+        typealias Value = BusinessService
+        static var defaultValue: BusinessService { BusinessService() }
+    }
+    
+    struct UIServiceKey: DependencyKey {
+        typealias Value = UIService
+        static var defaultValue: UIService { UIService() }
+    }
+    
+    // 동적 서비스 키들
+    struct DynamicServiceKey: DependencyKey {
+        let id: Int
+        
+        init(id: Int) {
+            self.id = id
+        }
+        
+        typealias Value = DynamicService
+        static var defaultValue: DynamicService { DynamicService(id: -1) }
+    }
+    
+    struct ChainedServiceKey: DependencyKey {
+        let id: Int
+        
+        init(id: Int) {
+            self.id = id
+        }
+        
+        typealias Value = ChainedService
+        static var defaultValue: ChainedService { ChainedService(id: -1, dependency: nil) }
+    }
+    
+    // 에러 복구 테스트용 키들
+    struct ReliableServiceKey: DependencyKey {
+        typealias Value = ReliableService
+        static var defaultValue: ReliableService { ReliableService() }
+    }
+    
+    struct UnreliableServiceKey: DependencyKey {
+        typealias Value = UnreliableService
+        static var defaultValue: UnreliableService { UnreliableService() }
+    }
+    
+    struct DependentServiceKey: DependencyKey {
+        typealias Value = DependentService
+        static var defaultValue: DependentService { 
+            DependentService(reliable: ReliableService(), unreliable: nil) 
+        }
+    }
+    
+    // 계층 서비스 키들
+    struct Layer0ServiceKey: DependencyKey {
+        typealias Value = Layer0Service
+        static var defaultValue: Layer0Service { Layer0Service() }
+    }
+    
+    struct Layer1ServiceKey: DependencyKey {
+        typealias Value = Layer1Service
+        static var defaultValue: Layer1Service { Layer1Service(dependency: Layer0Service()) }
+    }
+    
+    struct Layer2ServiceKey: DependencyKey {
+        typealias Value = Layer2Service
+        static var defaultValue: Layer2Service { Layer2Service(dependency: Layer1Service(dependency: Layer0Service())) }
+    }
+    
+    struct Layer3ServiceKey: DependencyKey {
+        typealias Value = Layer3Service
+        static var defaultValue: Layer3Service { 
+            Layer3Service(dependency: Layer2Service(dependency: Layer1Service(dependency: Layer0Service()))) 
+        }
+    }
+    
+    // 서비스 구현들
+    final class LoggerService: Sendable { init() {} }
+    final class ConfigService: Sendable { init() {} }
+    final class AnalyticsService: Sendable { init() {} }
+    final class NetworkService: Sendable { init() {} }
+    final class SecurityService: Sendable { init() {} }
+    final class DataService: Sendable { init() {} }
+    final class BusinessService: Sendable { init() {} }
+    final class UIService: Sendable { init() {} }
+    
+    final class DynamicService: Sendable {
+        let id: Int
+        init(id: Int) { self.id = id }
+    }
+    
+    final class ChainedService: Sendable {
+        let id: Int
+        let dependency: ChainedService?
+        init(id: Int, dependency: ChainedService?) {
+            self.id = id
+            self.dependency = dependency
+        }
+    }
+    
+    final class ReliableService: Sendable { init() {} }
+    final class UnreliableService: Sendable { init() {} }
+    
+    final class DependentService: Sendable {
+        let reliable: ReliableService
+        let unreliable: UnreliableService?
+        init(reliable: ReliableService, unreliable: UnreliableService?) {
+            self.reliable = reliable
+            self.unreliable = unreliable
+        }
+    }
+    
+    final class Layer0Service: Sendable { init() {} }
+    final class Layer1Service: Sendable {
+        let dependency: Layer0Service
+        init(dependency: Layer0Service) { self.dependency = dependency }
+    }
+    final class Layer2Service: Sendable {
+        let dependency: Layer1Service
+        init(dependency: Layer1Service) { self.dependency = dependency }
+    }
+    final class Layer3Service: Sendable {
+        let dependency: Layer2Service
+        init(dependency: Layer2Service) { self.dependency = dependency }
+    }
+}

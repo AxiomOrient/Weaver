@@ -15,6 +15,9 @@ actor FactoryCallCounter {
     func increment() {
         count += 1
     }
+    func reset() {
+        count = 0
+    }
 }
 
 /// 비동기 테스트에서 특정 작업의 완료를 기다리기 위한 동기화 유틸리티입니다.

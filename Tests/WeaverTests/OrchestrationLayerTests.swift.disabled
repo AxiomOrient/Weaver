@@ -1,0 +1,420 @@
+import Testing
+import Foundation
+@testable import Weaver
+
+// MARK: - Orchestration Layer 통합 테스트
+
+@Suite("Orchestration Layer - 커널, 전역 상태, 플랫폼 호환성")
+struct OrchestrationLayerTests {
+    
+    // MARK: - WeaverKernel 이중 초기화 전략 테스트
+    
+    @Test("Realistic 전략 - 즉시 사용 가능")
+    func testRealisticStrategyImmediateAvailability() async throws {
+        let modules = [TestModule()]
+        let kernel = WeaverKernel(modules: modules, strategy: .realistic)
+        
+        // 빌드 시작
+        await kernel.build()
+        
+        // 즉시 사용 가능해야 함
+        let service = await kernel.safeResolve(ServiceKey.self)
+        #expect(service.isDefaultValue == false)
+        
+        // 상태 확인
+        let state = await kernel.currentState
+        if case .ready = state {
+            // 성공
+        } else {
+            #expect(Bool(false), "Realistic 전략에서는 즉시 ready 상태가 되어야 함")
+        }
+        
+        await kernel.shutdown()
+    }
+    
+    @Test("Immediate 전략 - 완전 초기화 후 사용")
+    func testImmediateStrategyFullInitialization() async throws {
+        let modules = [TestModule()]
+        let kernel = WeaverKernel(modules: modules, strategy: .immediate)
+        
+        // 상태 스트림 관찰
+        var stateChanges: [LifecycleState] = []
+        let stateTask = Task {
+            for await state in kernel.stateStream {
+                stateChanges.append(state)
+                if case .ready = state {
+                    break
+                }
+            }
+        }
+        
+        // 빌드 시작
+        await kernel.build()
+        
+        // 준비 완료 대기
+        _ = try await kernel.waitForReady(timeout: nil)
+        
+        // 상태 변화 확인
+        stateTask.cancel()
+        #expect(stateChanges.contains { if case .configuring = $0 { return true }; return false })
+        #expect(stateChanges.contains { if case .ready = $0 { return true }; return false })
+        
+        await kernel.shutdown()
+    }
+    
+    @Test("커널 상태 스트림 관찰")
+    func testKernelStateStreamObservation() async throws {
+        let modules = [TestModule()]
+        let kernel = WeaverKernel(modules: modules, strategy: .immediate)
+        
+        var observedStates: [LifecycleState] = []
+        let observationTask = Task {
+            for await state in kernel.stateStream {
+                observedStates.append(state)
+                if case .shutdown = state {
+                    break
+                }
+            }
+        }
+        
+        // 생명주기 실행
+        await kernel.build()
+        _ = try await kernel.waitForReady(timeout: nil)
+        await kernel.shutdown()
+        
+        // 관찰 완료 대기
+        await observationTask.value
+        
+        // 예상된 상태 전환 확인
+        #expect(observedStates.count >= 3) // idle, configuring, ready, shutdown
+        #expect(observedStates.contains { if case .idle = $0 { return true }; return false })
+        #expect(observedStates.contains { if case .configuring = $0 { return true }; return false })
+        #expect(observedStates.contains { if case .ready = $0 { return true }; return false })
+        #expect(observedStates.contains { if case .shutdown = $0 { return true }; return false })
+    }
+    
+    // MARK: - WeaverGlobalState 전역 상태 관리 테스트
+    
+    @Test("전역 커널 설정 및 상태 동기화")
+    func testGlobalKernelManagement() async throws {
+        let globalState = WeaverGlobalState.shared
+        
+        // 초기 상태 확인
+        let initialKernel = await globalState.getGlobalKernel()
+        #expect(initialKernel == nil)
+        
+        // 커널 설정
+        let modules = [TestModule()]
+        let kernel = WeaverKernel(modules: modules, strategy: .realistic)
+        await globalState.setGlobalKernel(kernel)
+        
+        // 설정된 커널 확인
+        let setKernel = await globalState.getGlobalKernel()
+        #expect(setKernel != nil)
+        
+        // 상태 동기화 확인
+        await kernel.build()
+        let kernelState = await globalState.currentKernelState
+        if case .ready = kernelState {
+            // 성공
+        } else {
+            #expect(Bool(false), "커널 상태가 동기화되지 않음")
+        }
+        
+        // 정리
+        await kernel.shutdown()
+        await globalState.setGlobalKernel(nil)
+    }
+    
+    @Test("3단계 Fallback 시스템 검증")
+    func testThreeStageFallbackSystem() async throws {
+        let globalState = WeaverGlobalState.shared
+        
+        // 1단계: Preview 환경 시뮬레이션 (실제로는 어려우므로 로직 검증)
+        // 2단계: 전역 커널 없음
+        await globalState.setGlobalKernel(nil)
+        let serviceWithoutKernel = await globalState.safeResolve(ServiceKey.self)
+        #expect(serviceWithoutKernel.isDefaultValue == true)
+        
+        // 3단계: 전역 커널 있음
+        let modules = [TestModule()]
+        let kernel = WeaverKernel(modules: modules, strategy: .realistic)
+        await globalState.setGlobalKernel(kernel)
+        await kernel.build()
+        
+        let serviceWithKernel = await globalState.safeResolve(ServiceKey.self)
+        #expect(serviceWithKernel.isDefaultValue == false)
+        
+        // 정리
+        await kernel.shutdown()
+        await globalState.setGlobalKernel(nil)
+    }
+    
+    // MARK: - PlatformAppropriateLock 플랫폼 호환성 테스트
+    
+    @Test("iOS 15/16 플랫폼별 잠금 메커니즘 검증")
+    func testPlatformSpecificLockMechanism() async throws {
+        let lock = PlatformAppropriateLock(initialState: 0)
+        
+        // 잠금 메커니즘 정보 확인
+        let lockInfo = lock.lockMechanismInfo
+        
+        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, watchOS 9.0, *) {
+            #expect(lockInfo.contains("OSAllocatedUnfairLock"))
+        } else {
+            #expect(lockInfo.contains("NSLock"))
+        }
+        
+        print("🔒 사용 중인 잠금 메커니즘: \(lockInfo)")
+    }
+    
+    @Test("플랫폼 잠금 동시성 안전성 검증")
+    func testPlatformLockConcurrencySafety() async throws {
+        let lock = PlatformAppropriateLock(initialState: 0)
+        let iterations = 1000
+        
+        // 동시 증가 작업
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<iterations {
+                group.addTask {
+                    lock.withLock { state in
+                        state += 1
+                    }
+                }
+            }
+        }
+        
+        // 최종 값 확인
+        let finalValue = lock.withLock { $0 }
+        #expect(finalValue == iterations)
+    }
+    
+    @Test("플랫폼 잠금 성능 벤치마크")
+    func testPlatformLockPerformance() async throws {
+        let lock = PlatformAppropriateLock(initialState: 0)
+        let iterations = 10000
+        
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        for _ in 0..<iterations {
+            lock.withLock { state in
+                state += 1
+            }
+        }
+        
+        let duration = CFAbsoluteTimeGetCurrent() - startTime
+        let averageTime = duration / Double(iterations) * 1_000_000 // 마이크로초
+        
+        print("🚀 평균 잠금 시간: \(String(format: "%.3f", averageTime))μs")
+        #expect(averageTime < 10.0, "평균 잠금 시간이 10μs를 초과합니다")
+    }
+    
+    // MARK: - WeakBox 약한 참조 관리 테스트
+    
+    @Test("WeakBox 생명주기 관리")
+    func testWeakBoxLifecycleManagement() async throws {
+        var testObject: TestObject? = TestObject(id: "test")
+        let weakBox = WeakBox(testObject!)
+        
+        // 초기 상태 확인
+        let isAliveInitially = await weakBox.isAlive
+        #expect(isAliveInitially == true)
+        
+        let initialValue = await weakBox.getValue()
+        #expect(initialValue?.id == "test")
+        
+        // 강한 참조 해제
+        testObject = nil
+        
+        // 가비지 컬렉션 유도
+        for _ in 0..<10 {
+            _ = Array(0..<1000).map { _ in UUID() }
+        }
+        
+        // 약간의 지연 후 상태 확인
+        try await Task.sleep(nanoseconds: 100_000_000) // 0.1초
+        
+        let isAliveAfterGC = await weakBox.isAlive
+        let valueAfterGC = await weakBox.getValue()
+        
+        // 해제되었을 가능성이 높음 (보장되지는 않음)
+        if !isAliveAfterGC {
+            #expect(valueAfterGC == nil)
+        }
+    }
+    
+    @Test("WeakBoxCollection 자동 정리")
+    func testWeakBoxCollectionCleanup() async throws {
+        let collection = WeakBoxCollection<String, TestObject>()
+        
+        // 객체들 추가
+        var objects: [TestObject] = []
+        for i in 0..<10 {
+            let object = TestObject(id: "test\(i)")
+            objects.append(object)
+            await collection.set(object, for: "key\(i)")
+        }
+        
+        // 초기 메트릭 확인
+        let initialMetrics = await collection.getMetrics()
+        #expect(initialMetrics.totalWeakReferences == 10)
+        #expect(initialMetrics.aliveWeakReferences == 10)
+        
+        // 일부 객체 해제
+        objects.removeFirst(5)
+        
+        // 가비지 컬렉션 유도
+        for _ in 0..<10 {
+            _ = Array(0..<1000).map { _ in UUID() }
+        }
+        
+        // 정리 실행
+        let cleanedCount = await collection.cleanup()
+        
+        // 정리 후 메트릭 확인
+        let finalMetrics = await collection.getMetrics()
+        print("🧹 정리된 참조 수: \(cleanedCount)")
+        print("📊 최종 메트릭: \(finalMetrics)")
+        
+        #expect(finalMetrics.totalWeakReferences <= initialMetrics.totalWeakReferences)
+    }
+    
+    // MARK: - @Inject 프로퍼티 래퍼 테스트
+    
+    @Test("@Inject 프로퍼티 래퍼 안전한 호출")
+    func testInjectPropertyWrapperSafeCall() async throws {
+        // 전역 커널 설정
+        let modules = [TestModule()]
+        let kernel = WeaverKernel(modules: modules, strategy: .realistic)
+        await Weaver.setGlobalKernel(kernel)
+        await kernel.build()
+        
+        // @Inject 사용 클래스
+        class TestClient {
+            @Inject(ServiceKey.self) private var service
+            
+            func getService() async -> Service {
+                await service()
+            }
+        }
+        
+        let client = TestClient()
+        let service = await client.getService()
+        #expect(service.isDefaultValue == false)
+        
+        // 정리
+        await kernel.shutdown()
+        await Weaver.setGlobalKernel(nil)
+    }
+    
+    // MARK: - 통합 시나리오 테스트
+    
+    @Test("실제 앱 시작 시뮬레이션")
+    func testRealAppStartupSimulation() async throws {
+        // 1. 앱 시작 (realistic 전략)
+        let modules = [
+            LoggingModule(),
+            ConfigModule(),
+            AnalyticsModule(),
+            NetworkModule()
+        ]
+        let kernel = WeaverKernel(modules: modules, strategy: .realistic)
+        
+        // 2. 전역 설정
+        await Weaver.setGlobalKernel(kernel)
+        
+        // 3. 빌드 시작 (즉시 사용 가능)
+        await kernel.build()
+        
+        // 4. 즉시 의존성 사용 가능 검증
+        @Inject(LoggerServiceKey.self) var logger
+        let log = await logger()
+        #expect(log != nil)
+        
+        // 5. 백그라운드 초기화 완료 대기
+        _ = try await kernel.waitForReady(timeout: nil)
+        
+        // 6. 모든 서비스 사용 가능 검증
+        @Inject(NetworkServiceKey.self) var network
+        let networkService = await network()
+        #expect(networkService != nil)
+        
+        // 7. 정리
+        await kernel.shutdown()
+        await Weaver.setGlobalKernel(nil)
+    }
+}
+
+// MARK: - 테스트 지원 타입들
+
+extension OrchestrationLayerTests {
+    
+    // DependencyKey 정의들
+    struct ServiceKey: DependencyKey {
+        typealias Value = Service
+        static var defaultValue: Service { NullService(isDefaultValue: true) }
+    }
+    
+    struct LoggerServiceKey: DependencyKey {
+        typealias Value = LoggerService
+        static var defaultValue: LoggerService { LoggerService() }
+    }
+    
+    struct NetworkServiceKey: DependencyKey {
+        typealias Value = NetworkService
+        static var defaultValue: NetworkService { NetworkService() }
+    }
+    
+    // 테스트용 모듈들
+    struct TestModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(ServiceKey.self) { _ in TestService() }
+        }
+    }
+    
+    struct LoggingModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(LoggerServiceKey.self, scope: .appService) { _ in
+                LoggerService()
+            }
+        }
+    }
+    
+    struct ConfigModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            // 설정 서비스 등록
+        }
+    }
+    
+    struct AnalyticsModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            // 분석 서비스 등록
+        }
+    }
+    
+    struct NetworkModule: Module {
+        func configure(_ builder: WeaverBuilder) async {
+            await builder.register(NetworkServiceKey.self, scope: .appService) { _ in
+                NetworkService()
+            }
+        }
+    }
+    
+    // 테스트용 서비스들
+    final class LoggerService: Sendable {
+        init() {}
+    }
+    
+    final class NetworkService: Sendable {
+        init() {}
+    }
+    
+    // WeakBox 테스트용 객체
+    final class TestObject: Sendable {
+        let id: String
+        
+        init(id: String) {
+            self.id = id
+        }
+    }
+}

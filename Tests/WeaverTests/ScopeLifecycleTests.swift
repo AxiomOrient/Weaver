@@ -19,6 +19,8 @@ struct ScopeLifecycleTests {
 
     // Assert
     #expect(instance1.id == instance2.id, ".container 스코프는 항상 동일한 인스턴스를 반환해야 합니다.")
+    
+    await container.shutdown()
   }
 
   @Test("T2.2: .appService 스코프 - 동일 인스턴스 반환")
@@ -34,6 +36,8 @@ struct ScopeLifecycleTests {
 
     // Assert
     #expect(instance1.id == instance2.id, ".appService 스코프는 항상 동일한 인스턴스를 반환해야 합니다.")
+    
+    await container.shutdown()
   }
 
   @Test("T2.3: .weak 스코프 - 약한 참조 관리")
@@ -57,6 +61,8 @@ struct ScopeLifecycleTests {
 
     // Assert
     #expect(id1 != instance2.id, "약한 참조 객체가 해제된 후에는 새로운 인스턴스를 생성해야 합니다.")
+    
+    await container.shutdown()
   }
 
   @Test("T2.4: .container 스코프 - Disposable 객체 자동 해제")
@@ -127,6 +133,8 @@ struct ErrorHandlingTests {
     await #expect(throws: WeaverError.self) {
       _ = try await container.resolve(ServiceKey.self)
     }
+    
+    await container.shutdown()
   }
 
   /// - Intent: 서비스 A가 B를, B가 다시 A를 필요로 하는 순환 참조 상황에서 `circularDependency` 에러가 발생하는지 검증합니다.
@@ -154,5 +162,7 @@ struct ErrorHandlingTests {
     await #expect(throws: WeaverError.self) {
       _ = try await container.resolve(CircularAKey.self)
     }
+    
+    await container.shutdown()
   }
 }

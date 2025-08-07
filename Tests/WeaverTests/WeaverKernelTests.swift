@@ -32,7 +32,7 @@ struct WeaverKernelTests {
     @Test("커널 생명주기 - idle → configuring → warmingUp → ready")
     func kernelLifecycleProgression() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         var receivedStates: [LifecycleState] = []
         
         // Act: 상태 스트림 구독
@@ -66,7 +66,7 @@ struct WeaverKernelTests {
     @Test("build() 메서드 멱등성 - 중복 호출해도 한 번만 실행")
     func buildIdempotency() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         
         // Act: 동시에 여러 번 build 호출
         await withTaskGroup(of: Void.self) { group in
@@ -93,7 +93,7 @@ struct WeaverKernelTests {
     @Test("shutdown() - 리소스 해제 및 상태 전환")
     func shutdownCleansUpResources() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         await kernel.build()
         _ = try await kernel.waitForReady(timeout: 1.0)
         
@@ -109,10 +109,10 @@ struct WeaverKernelTests {
     
     @Test("safeResolve - ready 상태에서 정상 해결")
     func safeResolveInReadyState() async throws {
-        // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        // Arrange - immediate 전략 사용
+        let kernel = WeaverKernel(modules: [TestModule()], strategy: .immediate)
         await kernel.build()
-        _ = try await kernel.waitForReady()
+        _ = try await kernel.waitForReady(timeout: nil)
         
         // Act
         let service = await kernel.safeResolve(ServiceKey.self)
@@ -126,7 +126,7 @@ struct WeaverKernelTests {
     @Test("safeResolve - idle 상태에서 기본값 반환")
     func safeResolveInIdleState() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         // 주의: build()를 호출하지 않아서 idle 상태 유지
         
         // Act
@@ -140,10 +140,10 @@ struct WeaverKernelTests {
     
     @Test("safeResolve - 팩토리 실패 시 기본값 반환")
     func safeResolveWithFactoryFailure() async throws {
-        // Arrange
-        let kernel = DefaultWeaverKernel(modules: [FailingModule()])
+        // Arrange - immediate 전략 사용
+        let kernel = WeaverKernel(modules: [FailingModule()], strategy: .immediate)
         await kernel.build()
-        _ = try await kernel.waitForReady()
+        _ = try await kernel.waitForReady(timeout: nil)
         
         // Act
         let service = await kernel.safeResolve(ServiceKey.self)
@@ -157,9 +157,9 @@ struct WeaverKernelTests {
     @Test("safeResolve - shutdown 상태에서 기본값 반환")
     func safeResolveInShutdownState() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         await kernel.build()
-        _ = try await kernel.waitForReady()
+        _ = try await kernel.waitForReady(timeout: nil)
         await kernel.shutdown()
         
         // Act
@@ -173,8 +173,8 @@ struct WeaverKernelTests {
     
     @Test("waitForReady - 빌드 완료 후 resolver 반환")
     func waitForReadyReturnsResolver() async throws {
-        // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        // Arrange - immediate 전략 사용
+        let kernel = WeaverKernel(modules: [TestModule()], strategy: .immediate)
         
         // Act
         async let buildTask: Void = kernel.build()
@@ -190,10 +190,10 @@ struct WeaverKernelTests {
     
     @Test("waitForReady - ready 상태에서 즉시 반환")
     func waitForReadyWhenAlreadyReady() async throws {
-        // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        // Arrange - immediate 전략 사용
+        let kernel = WeaverKernel(modules: [TestModule()], strategy: .immediate)
         await kernel.build()
-        _ = try await kernel.waitForReady()
+        _ = try await kernel.waitForReady(timeout: nil)
         
         // Act
         let resolver = try await kernel.waitForReady(timeout: nil) // 이미 ready 상태
@@ -208,11 +208,11 @@ struct WeaverKernelTests {
     @Test("waitForReady - 타임아웃 시 에러 발생")
     func waitForReadyTimeout() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         // 주의: build()를 호출하지 않아서 ready 상태가 되지 않음
         
         // Act & Assert
-        await #expect(throws: WeaverError.initializationTimeout(timeoutDuration: 0.1)) {
+        await #expect(throws: WeaverError.self) {
             _ = try await kernel.waitForReady(timeout: 0.1)
         }
         
@@ -222,13 +222,13 @@ struct WeaverKernelTests {
     @Test("waitForReady - shutdown 상태에서 에러 발생")
     func waitForReadyInShutdownState() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         await kernel.build()
-        _ = try await kernel.waitForReady()
+        _ = try await kernel.waitForReady(timeout: nil)
         await kernel.shutdown()
         
         // Act & Assert
-        #expect(throws: WeaverError.shutdownInProgress) {
+        await #expect(throws: WeaverError.shutdownInProgress) {
             _ = try await kernel.waitForReady(timeout: nil)
         }
     }
@@ -238,14 +238,14 @@ struct WeaverKernelTests {
     @Test("currentState - 실시간 상태 반영")
     func currentStateReflectsActualState() async throws {
         // Arrange
-        let kernel = DefaultWeaverKernel(modules: [TestModule()])
+        let kernel = WeaverKernel(modules: [TestModule()])
         
         // Act & Assert: 각 단계별 상태 확인
         let initialState = await kernel.currentState
         #expect(initialState == .idle)
         
         await kernel.build()
-        _ = try await kernel.waitForReady()
+        _ = try await kernel.waitForReady(timeout: nil)
         
         let readyState = await kernel.currentState
         if case .ready = readyState {

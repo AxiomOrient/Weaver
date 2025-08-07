@@ -1,0 +1,379 @@
+import Testing
+import Foundation
+@testable import Weaver
+
+// MARK: - Core Layer 통합 테스트
+
+@Suite("Core Layer - DI 컨테이너 핵심 기능")
+struct CoreLayerIntegrationTests {
+    
+    // MARK: - WeaverContainer 핵심 기능 테스트
+    
+    @Test("기본 의존성 등록 및 해결")
+    func testBasicRegistrationAndResolution() async throws {
+        let container = await WeaverContainer.builder()
+            .register(ServiceKey.self) { _ in TestService() }
+            .build()
+        
+        let service = try await container.resolve(ServiceKey.self)
+        #expect(service.isDefaultValue == false)
+        #expect(service.id != UUID(uuidString: "00000000-0000-0000-0000-000000000000"))
+        
+        await container.shutdown()
+    }
+    
+    @Test("스코프별 인스턴스 관리 검증")
+    func testScopeBasedInstanceManagement() async throws {
+        let container = await WeaverContainer.builder()
+            .register(ContainerScopedKey.self, scope: .container) { _ in TestService() }
+            .register(TransientScopedKey.self, scope: .cached) { _ in TestService() }
+            .build()
+        
+        // Container 스코프: 동일한 인스턴스 반환
+        let service1 = try await container.resolve(ContainerScopedKey.self)
+        let service2 = try await container.resolve(ContainerScopedKey.self)
+        #expect(service1.id == service2.id)
+        
+        // Cached 스코프: 새로운 인스턴스 생성 가능
+        let service3 = try await container.resolve(TransientScopedKey.self)
+        let service4 = try await container.resolve(TransientScopedKey.self)
+        // 캐시 정책에 따라 동일하거나 다를 수 있음
+        
+        await container.shutdown()
+    }
+    
+    @Test("약한 참조 스코프 메모리 관리")
+    func testWeakScopeMemoryManagement() async throws {
+        let container = await WeaverContainer.builder()
+            .registerWeak(WeakServiceKey.self) { _ in WeakService() }
+            .build()
+        
+        // 약한 참조 인스턴스 생성
+        var weakService: WeakService? = try await container.resolve(WeakServiceKey.self)
+        let serviceId = weakService?.id
+        
+        // 강한 참조 해제
+        weakService = nil
+        
+        // 가비지 컬렉션 유도
+        for _ in 0..<10 {
+            _ = Array(0..<1000).map { _ in UUID() }
+        }
+        
+        // 메모리 정리 실행
+        await container.performMemoryCleanup(forced: true)
+        
+        // 메트릭 확인
+        let metrics = await container.getMetrics()
+        #expect(metrics.weakReferences.totalWeakReferences >= 0)
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - WeaverBuilder Fluent API 테스트
+    
+    @Test("Fluent API 체이닝 검증")
+    func testFluentAPIChaining() async throws {
+        let logger = TestLogger()
+        
+        let container = await WeaverContainer.builder()
+            .withLogger(logger)
+            .register(ServiceKey.self) { _ in TestService() }
+            .register(AnotherServiceKey.self) { _ in AnotherService() }
+            .override(ServiceKey.self) { _ in TestService(isDefaultValue: false) }
+            .build()
+        
+        let service = try await container.resolve(ServiceKey.self)
+        #expect(service.isDefaultValue == false)
+        
+        let anotherService = try await container.resolve(AnotherServiceKey.self)
+        #expect(anotherService is AnotherService)
+        
+        await container.shutdown()
+    }
+    
+    @Test("모듈 기반 구성 검증")
+    func testModuleBasedConfiguration() async throws {
+        struct TestModule: Module {
+            func configure(_ builder: WeaverBuilder) async {
+                await builder.register(ServiceKey.self) { _ in TestService() }
+                await builder.register(AnotherServiceKey.self) { _ in AnotherService() }
+            }
+        }
+        
+        let container = await WeaverContainer.builder()
+            .withModules([TestModule()])
+            .build()
+        
+        let service = try await container.resolve(ServiceKey.self)
+        #expect(service is TestService)
+        
+        let anotherService = try await container.resolve(AnotherServiceKey.self)
+        #expect(anotherService is AnotherService)
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - WeaverSyncStartup 동기 컨테이너 테스트
+    
+    @Test("동기 컨테이너 즉시 사용 가능성")
+    func testSyncContainerImmediateAvailability() async throws {
+        let syncContainer = WeaverSyncContainer.builder()
+            .register(ServiceKey.self) { _ in TestService() }
+            .build()
+        
+        // 동기적으로 캐시된 값 확인 (없어야 함)
+        let cachedService = syncContainer.resolveSync(ServiceKey.self)
+        #expect(cachedService == nil)
+        
+        // 비동기 해결
+        let service = try await syncContainer.resolve(ServiceKey.self)
+        #expect(service.isDefaultValue == false)
+        
+        // 이제 캐시된 값 확인 (있어야 함)
+        let nowCachedService = syncContainer.resolveSync(ServiceKey.self)
+        #expect(nowCachedService?.id == service.id)
+    }
+    
+    @Test("안전한 의존성 해결 - 실패시 기본값")
+    func testSafeResolutionWithFallback() async throws {
+        let syncContainer = WeaverSyncContainer.builder()
+            .register(FailingServiceKey.self) { _ in
+                throw TestError.factoryFailed
+            }
+            .build()
+        
+        // 안전한 해결 - 실패해도 기본값 반환
+        let service = await syncContainer.safeResolve(FailingServiceKey.self)
+        #expect(service.isDefaultValue == true)
+    }
+    
+    // MARK: - 8계층 우선순위 시스템 테스트
+    
+    @Test("앱 서비스 8계층 우선순위 초기화")
+    func testAppServicePriorityInitialization() async throws {
+        let initializationOrder = InitializationOrderTracker()
+        
+        let container = await WeaverContainer.builder()
+            // Layer 0: 로깅
+            .register(LoggerServiceKey.self, scope: .appService) { _ in
+                await initializationOrder.record("Logger", priority: 0)
+                return LoggerService()
+            }
+            // Layer 1: 설정
+            .register(ConfigServiceKey.self, scope: .appService) { _ in
+                await initializationOrder.record("Config", priority: 1)
+                return ConfigService()
+            }
+            // Layer 3: 네트워크
+            .register(NetworkServiceKey.self, scope: .appService) { _ in
+                await initializationOrder.record("Network", priority: 3)
+                return NetworkService()
+            }
+            // Layer 2: 분석
+            .register(AnalyticsServiceKey.self, scope: .appService) { _ in
+                await initializationOrder.record("Analytics", priority: 2)
+                return AnalyticsService()
+            }
+            .build()
+        
+        // 앱 서비스 초기화 실행
+        await container.initializeAppServiceDependencies { progress in
+            // 진행률 확인
+            #expect(progress >= 0.0 && progress <= 1.0)
+        }
+        
+        // 초기화 순서 검증
+        let order = await initializationOrder.getOrder()
+        let expectedOrder = ["Logger", "Config", "Analytics", "Network"]
+        #expect(order == expectedOrder)
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - 메모리 관리 및 정리 테스트
+    
+    @Test("메모리 정리 시스템 동작 검증")
+    func testMemoryCleanupSystem() async throws {
+        let container = await WeaverContainer.builder()
+            .registerWeak(WeakServiceKey.self) { _ in WeakService() }
+            .register(ServiceKey.self, scope: .cached) { _ in TestService() }
+            .build()
+        
+        // 인스턴스 생성
+        var weakServices: [WeakService] = []
+        for _ in 0..<10 {
+            let service = try await container.resolve(WeakServiceKey.self)
+            weakServices.append(service)
+        }
+        
+        // 일부 참조 해제
+        weakServices.removeFirst(5)
+        
+        // 메모리 정리 실행
+        await container.performMemoryCleanup(forced: true)
+        
+        // 메트릭 확인
+        let metrics = await container.getMetrics()
+        #expect(metrics.weakReferences.deallocatedWeakReferences >= 0)
+        
+        await container.shutdown()
+    }
+    
+    // MARK: - 에러 처리 테스트
+    
+    @Test("순환 의존성 감지 및 처리")
+    func testCircularDependencyDetection() async throws {
+        let container = await WeaverContainer.builder()
+            .register(CircularAKey.self) { resolver in
+                let serviceB = try await resolver.resolve(CircularBKey.self)
+                return CircularServiceA(serviceB: serviceB)
+            }
+            .register(CircularBKey.self) { resolver in
+                let serviceA = try await resolver.resolve(CircularAKey.self)
+                return CircularServiceB(serviceA: serviceA)
+            }
+            .build()
+        
+        do {
+            _ = try await container.resolve(CircularAKey.self)
+            #expect(Bool(false), "순환 의존성이 감지되지 않았습니다")
+        } catch let error as WeaverError {
+            if case .resolutionFailed(let resolutionError) = error,
+               case .circularDependency = resolutionError {
+                // 예상된 에러
+            } else {
+                #expect(Bool(false), "예상과 다른 에러 타입: \(error)")
+            }
+        }
+        
+        await container.shutdown()
+    }
+}
+
+// MARK: - 테스트 지원 타입들
+
+extension CoreLayerIntegrationTests {
+    
+    // DependencyKey 정의들
+    struct ServiceKey: DependencyKey {
+        typealias Value = Service
+        static var defaultValue: Service { NullService(isDefaultValue: true) }
+    }
+    
+    struct AnotherServiceKey: DependencyKey {
+        typealias Value = AnotherService
+        static var defaultValue: AnotherService { AnotherService(isDefaultValue: true) }
+    }
+    
+    struct ContainerScopedKey: DependencyKey {
+        typealias Value = Service
+        static var defaultValue: Service { NullService(isDefaultValue: true) }
+    }
+    
+    struct TransientScopedKey: DependencyKey {
+        typealias Value = Service
+        static var defaultValue: Service { NullService(isDefaultValue: true) }
+    }
+    
+    struct WeakServiceKey: DependencyKey {
+        typealias Value = WeakService
+        static var defaultValue: WeakService { WeakService(isDefaultValue: true) }
+    }
+    
+    struct FailingServiceKey: DependencyKey {
+        typealias Value = Service
+        static var defaultValue: Service { NullService(isDefaultValue: true) }
+    }
+    
+    // 8계층 우선순위 테스트용 키들
+    struct LoggerServiceKey: DependencyKey {
+        typealias Value = LoggerService
+        static var defaultValue: LoggerService { LoggerService() }
+    }
+    
+    struct ConfigServiceKey: DependencyKey {
+        typealias Value = ConfigService
+        static var defaultValue: ConfigService { ConfigService() }
+    }
+    
+    struct AnalyticsServiceKey: DependencyKey {
+        typealias Value = AnalyticsService
+        static var defaultValue: AnalyticsService { AnalyticsService() }
+    }
+    
+    struct NetworkServiceKey: DependencyKey {
+        typealias Value = NetworkService
+        static var defaultValue: NetworkService { NetworkService() }
+    }
+    
+    // 순환 의존성 테스트용 키들
+    struct CircularAKey: DependencyKey {
+        typealias Value = CircularServiceA
+        static var defaultValue: CircularServiceA { CircularServiceA(serviceB: CircularServiceB(serviceA: nil)) }
+    }
+    
+    struct CircularBKey: DependencyKey {
+        typealias Value = CircularServiceB
+        static var defaultValue: CircularServiceB { CircularServiceB(serviceA: nil) }
+    }
+    
+    // 테스트용 서비스 구현들
+    final class LoggerService: Sendable {
+        init() {}
+    }
+    
+    final class ConfigService: Sendable {
+        init() {}
+    }
+    
+    final class AnalyticsService: Sendable {
+        init() {}
+    }
+    
+    final class NetworkService: Sendable {
+        init() {}
+    }
+    
+    final class CircularServiceA: Sendable {
+        let serviceB: CircularServiceB
+        init(serviceB: CircularServiceB) {
+            self.serviceB = serviceB
+        }
+    }
+    
+    final class CircularServiceB: Sendable {
+        let serviceA: CircularServiceA?
+        init(serviceA: CircularServiceA?) {
+            self.serviceA = serviceA
+        }
+    }
+    
+    // 초기화 순서 추적기
+    actor InitializationOrderTracker {
+        private var order: [(name: String, priority: Int, timestamp: CFAbsoluteTime)] = []
+        
+        func record(_ name: String, priority: Int) {
+            order.append((name: name, priority: priority, timestamp: CFAbsoluteTimeGetCurrent()))
+        }
+        
+        func getOrder() -> [String] {
+            return order.sorted { $0.timestamp < $1.timestamp }.map { $0.name }
+        }
+    }
+    
+    // 테스트용 로거
+    final class TestLogger: WeaverLogger, Sendable {
+        func log(message: String, level: OSLogType) async {
+            print("[\(level)] \(message)")
+        }
+        
+        func logResolutionFailure(keyName: String, currentState: LifecycleState, error: any Error & Sendable) async {
+            print("[ERROR] Resolution failed for \(keyName): \(error)")
+        }
+        
+        func logStateTransition(from: LifecycleState, to: LifecycleState, reason: String?) async {
+            print("[STATE] \(from) -> \(to): \(reason ?? "no reason")")
+        }
+    }
+}
