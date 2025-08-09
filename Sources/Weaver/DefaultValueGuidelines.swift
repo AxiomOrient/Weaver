@@ -123,6 +123,7 @@ public enum NetworkError: Error, LocalizedError {
 public enum SampleDependencyKeys {
 
   /// 로거 서비스 키 - Null Object 패턴 사용
+  /// 권장 스코프: .startup (앱 전체에서 사용되는 기반 서비스)
   public struct LoggerKey: DependencyKey {
     public typealias Value = NoOpLogger
     public static var defaultValue: NoOpLogger {
@@ -134,6 +135,7 @@ public enum SampleDependencyKeys {
   }
 
   /// 설정 값 키 - 직접적인 기본값 사용
+  /// 권장 스코프: .startup (앱 시작 시 필요한 설정)
   public struct AppConfigKey: DependencyKey {
     public struct AppConfig: Sendable {
       public let apiTimeout: TimeInterval
@@ -159,10 +161,138 @@ public enum SampleDependencyKeys {
   }
 
   /// 네트워크 서비스 키 - Mock 객체 사용
+  /// 권장 스코프: .shared (여러 곳에서 공유되는 서비스)
   public struct NetworkServiceKey: DependencyKey {
     public typealias Value = OfflineNetworkService
     public static var defaultValue: OfflineNetworkService {
       OfflineNetworkService()  // 항상 안전한 오프라인 모드
     }
+  }
+  
+  /// 사용자 세션 키 - 상태 관리 서비스
+  /// 권장 스코프: .shared (앱 전체에서 공유되는 사용자 상태)
+  public struct UserSessionKey: DependencyKey {
+    public typealias Value = AnonymousUserSession
+    public static var defaultValue: AnonymousUserSession {
+      AnonymousUserSession()
+    }
+  }
+  
+  /// 이미지 처리 서비스 키 - 무거운 서비스
+  /// 권장 스코프: .whenNeeded (특정 기능에서만 사용, 메모리 사용량 큼)
+  public struct ImageProcessingServiceKey: DependencyKey {
+    public typealias Value = BasicImageProcessor
+    public static var defaultValue: BasicImageProcessor {
+      BasicImageProcessor()
+    }
+  }
+  
+  /// UUID 생성기 키 - 상태 없는 유틸리티
+  /// 권장 스코프: .transient (매번 새로운 인스턴스 필요)
+  public struct UUIDGeneratorKey: DependencyKey {
+    public typealias Value = SystemUUIDGenerator
+    public static var defaultValue: SystemUUIDGenerator {
+      SystemUUIDGenerator()
+    }
+  }
+}
+
+// MARK: - ==================== 스코프별 권장 패턴 ====================
+
+/// 스코프별 권장 사용 패턴과 예시를 제공합니다.
+public enum ScopePatterns {
+  
+  /// .startup 스코프 권장 패턴
+  /// - 앱 시작 시 반드시 필요한 서비스
+  /// - 다른 서비스들이 의존하는 기반 서비스
+  /// - 초기화 시간이 오래 걸리는 서비스
+  public enum Startup {
+    /// 로깅 서비스 패턴
+    public static func logger() -> (any DependencyKey.Type, Scope) {
+      return (SampleDependencyKeys.LoggerKey.self, .startup)
+    }
+    
+    /// 설정 서비스 패턴
+    public static func configuration() -> (any DependencyKey.Type, Scope) {
+      return (SampleDependencyKeys.AppConfigKey.self, .startup)
+    }
+  }
+  
+  /// .shared 스코프 권장 패턴
+  /// - 여러 곳에서 공유되는 서비스
+  /// - 상태를 유지해야 하는 서비스
+  /// - 일반적인 비즈니스 로직 서비스
+  public enum Shared {
+    /// 네트워크 서비스 패턴
+    public static func network() -> (any DependencyKey.Type, Scope) {
+      return (SampleDependencyKeys.NetworkServiceKey.self, .shared)
+    }
+    
+    /// 사용자 세션 패턴
+    public static func userSession() -> (any DependencyKey.Type, Scope) {
+      return (SampleDependencyKeys.UserSessionKey.self, .shared)
+    }
+  }
+  
+  /// .whenNeeded 스코프 권장 패턴
+  /// - 특정 기능에서만 사용되는 서비스
+  /// - 메모리 사용량이 큰 서비스
+  /// - 초기화 비용이 높은 서비스
+  public enum WhenNeeded {
+    /// 이미지 처리 서비스 패턴
+    public static func imageProcessing() -> (any DependencyKey.Type, Scope) {
+      return (SampleDependencyKeys.ImageProcessingServiceKey.self, .whenNeeded)
+    }
+  }
+  
+  /// .transient 스코프 권장 패턴
+  /// - 상태를 공유하면 안 되는 서비스
+  /// - 매번 새로운 인스턴스가 필요한 경우
+  /// - 가벼운 유틸리티 서비스
+  public enum Transient {
+    /// UUID 생성기 패턴
+    public static func uuidGenerator() -> (any DependencyKey.Type, Scope) {
+      return (SampleDependencyKeys.UUIDGeneratorKey.self, .transient)
+    }
+  }
+}
+
+// MARK: - ==================== 추가 Mock 서비스들 ====================
+
+/// 익명 사용자 세션 Mock
+public struct AnonymousUserSession: Sendable {
+  public let isLoggedIn = false
+  public let userId: String? = nil
+  
+  public init() {}
+  
+  public func login(username: String, password: String) async -> Bool {
+    return false // Mock에서는 항상 실패
+  }
+}
+
+/// 기본 이미지 처리기 Mock
+public struct BasicImageProcessor: Sendable {
+  public init() {}
+  
+  public func resize(image: Data, to size: CGSize) async -> Data {
+    return image // Mock에서는 원본 반환
+  }
+  
+  public func applyFilter(image: Data, filter: String) async -> Data {
+    return image // Mock에서는 원본 반환
+  }
+}
+
+/// 시스템 UUID 생성기
+public struct SystemUUIDGenerator: Sendable {
+  public init() {}
+  
+  public func generate() -> String {
+    return UUID().uuidString
+  }
+  
+  public func generateShort() -> String {
+    return String(UUID().uuidString.prefix(8))
   }
 }

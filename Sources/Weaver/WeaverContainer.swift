@@ -149,7 +149,7 @@ public actor WeaverContainer: Resolver {
   ) async {
     let appServiceKeys = registrations.filter { 
       // startup 스코프의 서비스들을 앱 서비스로 간주
-      $1.scope == .startup 
+      $1.scope == Scope.startup 
     }.map { $0.key }
     guard !appServiceKeys.isEmpty else {
       await onProgress(1.0)
@@ -176,7 +176,7 @@ public actor WeaverContainer: Resolver {
       let priority = await lifecycleManager.getAppServicePriority(for: key, registrations: registrations)
 
       do {
-        _ = try await resolutionCoordinator.resolve(key)
+        _ = try await self.resolve(key)
         await logger?.log(
           message:
             "✅ App service ready [\(index + 1)/\(totalCount)] Priority-\(priority): \(serviceName)",
@@ -353,6 +353,8 @@ actor ResolutionCoordinator: Resolver {
       return try await getOrCreateContainerInstance(key: key, registration: registration)
     case .weak:
       return try await getOrCreateWeakInstance(key: key, registration: registration)
+    case .transient:
+      return try await createTransientInstance(key: key, registration: registration)
     }
   }
 
@@ -590,6 +592,31 @@ actor ResolutionCoordinator: Resolver {
 
   // createWeakInstance 메서드는 getOrCreateWeakInstance로 통합됨
 
+  private func createTransientInstance(
+    key: AnyDependencyKey,
+    registration: DependencyRegistration
+  ) async throws -> any Sendable {
+    // Transient 스코프는 캐시하지 않고 매번 새로운 인스턴스 생성
+    do {
+      let instance = try await registration.factory(self)
+      
+      await logger?.log(
+        message: "🔄 Transient instance created: \(key.description)",
+        level: .debug
+      )
+      
+      return instance
+    } catch {
+      // 팩토리 에러를 WeaverError로 래핑
+      if error is WeaverError {
+        throw error
+      } else {
+        throw WeaverError.resolutionFailed(
+          .factoryFailed(keyName: key.description, underlying: error))
+      }
+    }
+  }
+
   private func setupWeakReference(key: AnyDependencyKey, instance: any Sendable) throws {
     // 약한 참조는 클래스 타입만 가능하므로 AnyObject 체크
     // 실제로는 struct나 enum 타입의 Sendable도 있으므로 체크가 필요하지만
@@ -632,7 +659,7 @@ actor ContainerLifecycleManager {
 
     let appServiceKeys = registrations.filter { 
       // startup 스코프의 서비스들을 앱 서비스로 간주
-      $1.scope == .startup 
+      $1.scope == Scope.startup 
     }.map { $0.key }
 
     // 🔧 [CRITICAL FIX] 백그라운드 진입 시 역순 처리
@@ -669,7 +696,7 @@ actor ContainerLifecycleManager {
 
     let appServiceKeys = registrations.filter { 
       // startup 스코프의 서비스들을 앱 서비스로 간주
-      $1.scope == .startup 
+      $1.scope == Scope.startup 
     }.map { $0.key }
 
     // 🔧 [CRITICAL FIX] 포그라운드 복귀 시 정순 처리
@@ -704,7 +731,7 @@ actor ContainerLifecycleManager {
 
     let appServiceKeys = registrations.filter { 
       // startup 스코프의 서비스들을 앱 서비스로 간주
-      $1.scope == .startup 
+      $1.scope == Scope.startup 
     }.map { $0.key }
 
     // 🔧 [CRITICAL FIX] 초기화 순서의 엄격한 역순으로 정리 (LIFO: Last In, First Out)
@@ -800,6 +827,8 @@ actor ContainerLifecycleManager {
       return 200 // 필요시 로딩 서비스
     case .weak:
       return 300 // 약한 참조 서비스
+    case .transient:
+      return 400 // 일회성 서비스 - 가장 낮은 우선순위
     }
   }
   
@@ -844,7 +873,7 @@ actor ContainerLifecycleManager {
   
   /// 의존성 개수 기반 추가 우선순위 조정을 반환합니다.
   /// 의존성이 적은 서비스일수록 먼저 초기화됩니다.
-  private func getDependencyBasedPriority(_ dependencies: [String]) -> Int {
+  private func getDependencyBasedPriority(_ dependencies: [any DependencyKey.Type]) -> Int {
     // 의존성이 많을수록 나중에 초기화 (최대 9까지)
     return min(dependencies.count, 9)
   }
@@ -866,7 +895,7 @@ struct ScopeMetrics {
 // MARK: - ==================== 핵심 타입 정의 ====================
 
 /// 의존성의 생명주기를 정의하는 스코프 타입입니다.
-/// 사용자 관점에서 직관적이고 명확한 4가지 스코프를 제공합니다.
+/// 사용자 관점에서 직관적이고 명확한 5가지 스코프를 제공합니다.
 public enum Scope: String, Sendable {
   /// 앱 전체에서 하나의 인스턴스를 공유합니다 (싱글톤)
   /// 로깅, 설정, 네트워크 서비스 등에 사용
@@ -883,6 +912,10 @@ public enum Scope: String, Sendable {
   /// 실제 사용할 때만 로딩되는 기능별 서비스입니다
   /// 카메라, 결제, 위치 서비스 등에 사용
   case whenNeeded
+
+  /// 매번 새로운 인스턴스를 생성합니다 (일회성)
+  /// 상태를 가지는 Worker, 계산 객체, 임시 서비스 등에 사용
+  case transient
 }
 
 /// 의존성의 초기화 시점을 정의하는 내부 열거형입니다.
@@ -895,20 +928,7 @@ internal enum InitializationTiming: String, Sendable, CaseIterable {
   case onDemand
 }
 
-/// `DependencyKey`의 타입 정보를 타입 소거 형태로 감싸는 구조체입니다.
-public struct AnyDependencyKey: Hashable, CustomStringConvertible, Sendable {
-  private let id: ObjectIdentifier
-  private let name: String
 
-  public init<Key: DependencyKey>(_ keyType: Key.Type) {
-    self.id = ObjectIdentifier(keyType)
-    self.name = String(describing: keyType)
-  }
-
-  public static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
-  public func hash(into hasher: inout Hasher) { hasher.combine(id) }
-  public var description: String { name }
-}
 
 /// 의존성 등록 정보를 담는 구조체입니다.
 public struct DependencyRegistration: Sendable {
@@ -916,19 +936,44 @@ public struct DependencyRegistration: Sendable {
   internal let timing: InitializationTiming  // internal로 변경
   public let factory: @Sendable (Resolver) async throws -> any Sendable
   public let keyName: String
-  public let dependencies: [String]
+  public let dependencies: [any DependencyKey.Type]
+  /// 타입 기반 편의 API에서 제공된 직접 기본값 (타입 소거됨)
+  internal let directDefaultValue: (any Sendable)?
+  /// 빌드 타임 순환 참조 감지를 위한 명시적 의존성 키들
+  internal let explicitDependencies: Set<AnyDependencyKey>?
 
   public init(
     scope: Scope,
     factory: @escaping @Sendable (Resolver) async throws -> any Sendable,
     keyName: String,
-    dependencies: [String] = []
+    dependencies: [any DependencyKey.Type] = [],
+    explicitDependencies: Set<AnyDependencyKey>? = nil
   ) {
     self.scope = scope
     self.timing = Self.getTimingForScope(scope)
     self.factory = factory
     self.keyName = keyName
     self.dependencies = dependencies
+    self.directDefaultValue = nil  // 일반 등록에서는 nil
+    self.explicitDependencies = explicitDependencies
+  }
+  
+  /// 타입 기반 편의 API를 위한 내부 이니셜라이저
+  internal init(
+    scope: Scope,
+    factory: @escaping @Sendable (Resolver) async throws -> any Sendable,
+    keyName: String,
+    dependencies: [any DependencyKey.Type] = [],
+    directDefaultValue: any Sendable,
+    explicitDependencies: Set<AnyDependencyKey>? = nil
+  ) {
+    self.scope = scope
+    self.timing = Self.getTimingForScope(scope)
+    self.factory = factory
+    self.keyName = keyName
+    self.dependencies = dependencies
+    self.directDefaultValue = directDefaultValue
+    self.explicitDependencies = explicitDependencies
   }
   
   /// 스코프에 따라 최적의 초기화 시점을 자동으로 결정합니다.
@@ -936,11 +981,13 @@ public struct DependencyRegistration: Sendable {
     switch scope {
     case .startup:
       return .eager      // 앱 시작 시 즉시 로딩
-    case .shared, .weak, .whenNeeded:
+    case .shared, .weak, .whenNeeded, .transient:
       return .onDemand   // 필요할 때 로딩
     }
   }
 }
+
+
 
 /// 의존성 해결 통계 정보를 담는 구조체입니다.
 public struct ResolutionMetrics: Sendable, CustomStringConvertible {
@@ -1108,7 +1155,7 @@ public struct WeakReferenceMetrics: Sendable {
 
 extension ResolutionCoordinator {
   /// AnyDependencyKey를 직접 해결하는 내부 메서드
-  func resolve(_ key: AnyDependencyKey) async throws -> any Sendable {
+  func resolveAny(_ key: AnyDependencyKey) async throws -> any Sendable {
     // 순환 참조 검사
     let currentEntry = ResolutionStackEntry(key: key, containerID: ObjectIdentifier(self))
     if Self.resolutionSet.contains(currentEntry) {
@@ -1127,7 +1174,7 @@ extension ResolutionCoordinator {
   private func _resolveInternalAny(key: AnyDependencyKey) async throws -> any Sendable {
     guard let registration = registrations[key] else {
       if let parent {
-        // 부모 컨테이너의 resolve 메서드를 직접 호출
+        // 부모 컨테이너의 AnyDependencyKey resolve 메서드를 호출
         return try await parent.resolve(key)
       }
       throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
@@ -1145,7 +1192,7 @@ extension WeaverContainer {
     let startTime = CFAbsoluteTimeGetCurrent()
 
     do {
-      let instance = try await resolutionCoordinator.resolve(key)
+      let instance = try await resolutionCoordinator.resolveAny(key)
 
       let duration = CFAbsoluteTimeGetCurrent() - startTime
       await metricsCollector.recordResolution(duration: duration)
@@ -1191,6 +1238,7 @@ public struct DefaultServicePriorityProvider: ServicePriorityProvider {
         case .shared: return 100
         case .whenNeeded: return 200
         case .weak: return 300
+        case .transient: return 400
         }
     }
     
@@ -1207,7 +1255,7 @@ public struct DefaultServicePriorityProvider: ServicePriorityProvider {
         return 60
     }
     
-    private func getDependencyBasedPriority(_ dependencies: [String]) -> Int {
+    private func getDependencyBasedPriority(_ dependencies: [any DependencyKey.Type]) -> Int {
         return min(dependencies.count, 9)
     }
 }

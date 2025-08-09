@@ -836,10 +836,12 @@ protocol Module: Sendable {
 
 ### 3. 스코프 확장
 ```swift
-enum Scope: String, Sendable {
-    case container, weak, cached     // 기본 스코프
-    case appService                  // 앱 생명주기 연동
-    case bootstrap, core, feature    // 계층별 스코프
+public enum Scope: String, Sendable {
+    case shared      // 앱 전체에서 하나의 인스턴스 공유 (싱글톤)
+    case weak        // 약한 참조로 관리되어 메모리 누수 방지
+    case startup     // 앱 시작 시 미리 로딩되는 필수 서비스
+    case whenNeeded  // 실제 사용할 때만 로딩되는 기능별 서비스
+    case transient   // 매번 새로운 인스턴스를 생성 (일회성)
 }
 ```
 

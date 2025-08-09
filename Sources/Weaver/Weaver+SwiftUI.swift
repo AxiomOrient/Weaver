@@ -87,15 +87,15 @@ public struct WeaverViewModifier: ViewModifier {
                 await module.configure(builder)
             }
             
-            let newContainer = await builder.build()
+            let newContainer = try await builder.build()
             
             if setAsGlobal {
                 // 전역 커널로 설정
                 let kernel = WeaverKernel(modules: modules)
                 await Weaver.setGlobalKernel(kernel)
-                await kernel.build()
+                try await kernel.build()
                 // 🚀 Swift 6 방식: 안전한 타임아웃 기반 준비 대기
-                _ = try await kernel.waitForReady()
+                _ = try await kernel.ensureReady()
             }
             
             await MainActor.run {
