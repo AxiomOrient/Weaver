@@ -339,9 +339,9 @@ struct TestModule: Module {
 struct ModuleMetadata: Sendable {
     let name: String
     let version: String
-    let dependencies: [String]
+    let dependencies: [any DependencyKey.Type]
     
-    init(name: String = "TestModule", version: String = "1.0.0", dependencies: [String] = []) {
+    init(name: String = "TestModule", version: String = "1.0.0", dependencies: [any DependencyKey.Type] = []) {
         self.name = name
         self.version = version
         self.dependencies = dependencies

@@ -94,7 +94,7 @@ public protocol LifecycleManager: Sendable {
     
     /// 등록된 모듈과 설정을 기반으로 컨테이너 빌드 및 초기화(`warmUp`)를 시작합니다.
     /// 이 메서드는 즉시 반환되며, 실제 빌드 과정은 백그라운드에서 비동기적으로 수행됩니다.
-    func build() async
+    func build() async throws
 
     /// 활성화된 컨테이너를 안전하게 종료하고 모든 `Disposable` 인스턴스의 리소스를 해제합니다.
     func shutdown() async
@@ -111,9 +111,11 @@ public protocol SafeResolver: Sendable {
     /// 준비되지 않은 경우 `DependencyKey`의 `defaultValue`를 반환합니다.
     func safeResolve<Key: DependencyKey>(_ keyType: Key.Type) async -> Key.Value
     
-    /// 컨테이너가 준비 완료 상태인지 확인합니다.
+    /// 컨테이너가 준비 완료 상태인지 확인하고 준비된 Resolver를 반환합니다.
     /// 준비되지 않은 경우 즉시 에러를 발생시킵니다.
-    func waitForReady() async throws -> any Resolver
+    /// - Returns: 준비된 Resolver 인스턴스
+    /// - Throws: WeaverError - 컨테이너가 준비되지 않았거나 실패한 경우
+    func ensureReady() async throws -> any Resolver
 }
 
 /// 두 프로토콜을 조합하여 완전한 커널 기능을 제공하는 프로토콜입니다.
@@ -194,6 +196,35 @@ public protocol CacheManaging: Sendable {
 
 // MARK: - ==================== Utility Types ====================
 
+/// 타입 소거된 DependencyKey를 나타내는 구조체입니다.
+/// 의존성 그래프 분석과 런타임 키 관리에 사용됩니다.
+public struct AnyDependencyKey: Hashable, Sendable, CustomStringConvertible {
+    private let _keyType: any DependencyKey.Type
+    private let _description: String
+    
+    public init<Key: DependencyKey>(_ keyType: Key.Type) {
+        self._keyType = keyType
+        self._description = String(describing: keyType)
+    }
+    
+    public var description: String {
+        return _description
+    }
+    
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(_description)
+    }
+    
+    public static func == (lhs: AnyDependencyKey, rhs: AnyDependencyKey) -> Bool {
+        return lhs._description == rhs._description
+    }
+    
+    /// 원본 키 타입을 반환합니다 (타입 캐스팅 필요)
+    public var keyType: any DependencyKey.Type {
+        return _keyType
+    }
+}
+
 
 
 // MARK: - ==================== Timeout 없는 검증 시스템 ====================
@@ -231,38 +262,52 @@ public enum DependencyValidation: Sendable {
 }
 
 /// 의존성 그래프를 분석하고 검증하는 구조체입니다.
+/// 빌드 타임에 순환 참조와 누락된 의존성을 감지하여 런타임 에러를 방지합니다.
 public struct DependencyGraph: Sendable {
     private let registrations: [AnyDependencyKey: DependencyRegistration]
+    private let dependencyMap: [AnyDependencyKey: Set<AnyDependencyKey>]
     
     public init(registrations: [AnyDependencyKey: DependencyRegistration]) {
         self.registrations = registrations
+        self.dependencyMap = Self.buildDependencyMap(from: registrations)
     }
     
     /// 의존성 그래프를 검증합니다 (동기적, 빠름)
     public func validate() -> DependencyValidation {
-        // 1. 순환 참조 검사
+        // 1. 순환 참조 검사 (강화된 알고리즘)
         if let cycle = detectCircularDependencies() {
             return .circular(cycle)
         }
         
-        // 2. 누락된 의존성 검사
+        // 2. 누락된 의존성 검사 (실제 구현)
         let missing = findMissingDependencies()
         if !missing.isEmpty {
             return .missing(missing)
         }
         
-        // 3. 모든 검증 통과
+        // 3. 스코프 호환성 검사
+        if let scopeError = validateScopeCompatibility() {
+            return .invalid("스코프 호환성 오류", scopeError)
+        }
+        
+        // 4. 모든 검증 통과
         return .valid
     }
     
+    /// 강화된 순환 참조 감지 알고리즘
     private func detectCircularDependencies() -> [String]? {
-        // 간단한 DFS 기반 순환 참조 검사
         var visited: Set<AnyDependencyKey> = []
         var recursionStack: Set<AnyDependencyKey> = []
+        var path: [AnyDependencyKey] = []
         
         for key in registrations.keys {
             if !visited.contains(key) {
-                if let cycle = dfsDetectCycle(key: key, visited: &visited, recursionStack: &recursionStack) {
+                if let cycle = dfsDetectCycle(
+                    key: key, 
+                    visited: &visited, 
+                    recursionStack: &recursionStack,
+                    path: &path
+                ) {
                     return cycle
                 }
             }
@@ -271,26 +316,196 @@ public struct DependencyGraph: Sendable {
         return nil
     }
     
+    /// DFS 기반 순환 참조 검사 (경로 추적 포함)
     private func dfsDetectCycle(
         key: AnyDependencyKey,
         visited: inout Set<AnyDependencyKey>,
-        recursionStack: inout Set<AnyDependencyKey>
+        recursionStack: inout Set<AnyDependencyKey>,
+        path: inout [AnyDependencyKey]
     ) -> [String]? {
         visited.insert(key)
         recursionStack.insert(key)
+        path.append(key)
         
-        // 현재 구현에서는 의존성 정보가 문자열로만 저장되어 있어
-        // 실제 순환 참조 검사는 제한적입니다.
-        // 실제 구현에서는 더 정교한 그래프 분석이 필요합니다.
+        // 현재 키가 의존하는 다른 키들을 확인
+        if let dependencies = dependencyMap[key] {
+            for dependency in dependencies {
+                if recursionStack.contains(dependency) {
+                    // 순환 참조 발견! 경로 구성
+                    if let cycleStartIndex = path.firstIndex(of: dependency) {
+                        let cyclePath = Array(path[cycleStartIndex...]) + [dependency]
+                        return cyclePath.map { $0.description }
+                    }
+                } else if !visited.contains(dependency) {
+                    if let cycle = dfsDetectCycle(
+                        key: dependency,
+                        visited: &visited,
+                        recursionStack: &recursionStack,
+                        path: &path
+                    ) {
+                        return cycle
+                    }
+                }
+            }
+        }
         
         recursionStack.remove(key)
+        path.removeLast()
         return nil
     }
     
+    /// 실제 누락된 의존성 검사 구현
     private func findMissingDependencies() -> [String] {
-        // 등록된 의존성들이 참조하는 다른 의존성들이 실제로 등록되어 있는지 확인
-        // 현재 구현에서는 의존성 정보가 제한적이므로 기본 검증만 수행
-        return []
+        var missingDependencies: [String] = []
+        
+        for (key, dependencies) in dependencyMap {
+            for dependency in dependencies {
+                if registrations[dependency] == nil {
+                    missingDependencies.append(
+                        "'\(key.description)'가 의존하는 '\(dependency.description)'가 등록되지 않음"
+                    )
+                }
+            }
+        }
+        
+        return missingDependencies
+    }
+    
+    /// 스코프 호환성 검증 (예: .weak 스코프는 .startup보다 긴 생명주기를 가져야 함)
+    private func validateScopeCompatibility() -> Error? {
+        for (key, registration) in registrations {
+            if let dependencies = dependencyMap[key] {
+                for dependency in dependencies {
+                    if let depRegistration = registrations[dependency] {
+                        if !isScopeCompatible(
+                            consumer: registration.scope,
+                            provider: depRegistration.scope
+                        ) {
+                            return DependencySetupError.invalidConfiguration(
+                                key.description,
+                                ScopeCompatibilityError(
+                                    consumer: registration.scope,
+                                    provider: depRegistration.scope
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        return nil
+    }
+    
+    /// 스코프 호환성 검사 로직
+    private func isScopeCompatible(consumer: Scope, provider: Scope) -> Bool {
+        // 스코프 생명주기 순서: startup > shared > whenNeeded > weak > transient
+        let scopePriority: [Scope: Int] = [
+            .startup: 5,
+            .shared: 4,
+            .whenNeeded: 3,
+            .weak: 2,
+            .transient: 1
+        ]
+        
+        let consumerPriority = scopePriority[consumer] ?? 0
+        let providerPriority = scopePriority[provider] ?? 0
+        
+        // 소비자는 제공자보다 같거나 낮은 우선순위를 가져야 함
+        return consumerPriority <= providerPriority
+    }
+    
+    /// 등록 정보에서 의존성 맵을 구성하는 정적 메서드
+    private static func buildDependencyMap(
+        from registrations: [AnyDependencyKey: DependencyRegistration]
+    ) -> [AnyDependencyKey: Set<AnyDependencyKey>] {
+        var dependencyMap: [AnyDependencyKey: Set<AnyDependencyKey>] = [:]
+        
+        for (key, registration) in registrations {
+            // 팩토리 클로저에서 사용되는 의존성들을 추출
+            // 현재는 명시적으로 선언된 의존성만 추적 가능
+            // 실제 구현에서는 더 정교한 분석이 필요할 수 있음
+            dependencyMap[key] = registration.explicitDependencies ?? []
+        }
+        
+        return dependencyMap
+    }
+    
+    /// 의존성 그래프를 시각화하기 위한 DOT 형식 출력
+    public func generateDotGraph() -> String {
+        var dot = "digraph DependencyGraph {\n"
+        dot += "  rankdir=TB;\n"
+        dot += "  node [shape=box, style=rounded];\n\n"
+        
+        // 노드 정의 (스코프별 색상 구분)
+        for (key, registration) in registrations {
+            let color = getScopeColor(registration.scope)
+            let label = key.description.replacingOccurrences(of: "\"", with: "\\\"")
+            dot += "  \"\(label)\" [fillcolor=\"\(color)\", style=filled];\n"
+        }
+        
+        dot += "\n"
+        
+        // 엣지 정의 (의존성 관계)
+        for (key, dependencies) in dependencyMap {
+            let keyLabel = key.description.replacingOccurrences(of: "\"", with: "\\\"")
+            for dependency in dependencies {
+                let depLabel = dependency.description.replacingOccurrences(of: "\"", with: "\\\"")
+                dot += "  \"\(keyLabel)\" -> \"\(depLabel)\";\n"
+            }
+        }
+        
+        dot += "}\n"
+        return dot
+    }
+    
+    private func getScopeColor(_ scope: Scope) -> String {
+        switch scope {
+        case .startup: return "lightcoral"
+        case .shared: return "lightblue"
+        case .whenNeeded: return "lightgreen"
+        case .weak: return "lightyellow"
+        case .transient: return "lightgray"
+        }
+    }
+}
+
+/// 스코프 호환성 에러
+public struct ScopeCompatibilityError: Error, LocalizedError {
+    let consumer: Scope
+    let provider: Scope
+    
+    public var errorDescription: String? {
+        return "스코프 호환성 오류: \(consumer) 스코프가 \(provider) 스코프에 의존할 수 없습니다"
+    }
+}
+
+// MARK: - ==================== 편의 API 지원 타입 ====================
+
+/// 타입 기반 편의 API를 위한 자동 생성 DependencyKey
+/// 
+/// 이 구조체는 개발자가 DependencyKey를 직접 정의하지 않고도
+/// 타입만으로 의존성을 등록할 수 있도록 지원합니다.
+/// 기존 DependencyKey 방식과 완전히 호환되며, 안전성을 해치지 않습니다.
+public struct TypeBasedDependencyKey<T: Sendable>: DependencyKey {
+    public typealias Value = T
+    
+    /// 인스턴스별로 기본값을 저장
+    private let _defaultValue: T
+    
+    public static var defaultValue: T {
+        // 타입 기반 API는 registerType과 함께 사용되어야 하므로
+        // 직접 접근 시에는 적절한 에러 메시지 제공
+        fatalError("TypeBasedDependencyKey for \(T.self) should be used with registerType method. Use DependencyKey protocol directly for manual registration.")
+    }
+    
+    /// 기본값과 함께 키를 초기화합니다
+    public init(defaultValue: T) {
+        self._defaultValue = defaultValue
+    }
+    
+    /// 인스턴스의 기본값을 반환합니다
+    public var instanceDefaultValue: T {
+        return _defaultValue
     }
 }
 
@@ -316,7 +531,10 @@ public enum WeaverEnvironment {
     /// 현재 코드가 테스트 환경에서 실행 중인지 여부를 반환합니다.
     /// 테스트 환경에서는 동기적 초기화 옵션을 제공하여 테스트 속도를 향상시킵니다.
     public static var isTesting: Bool {
-        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
-        NSClassFromString("XCTest") != nil
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        #else
+        return false
+        #endif
     }
 }

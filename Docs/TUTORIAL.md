@@ -697,6 +697,37 @@ struct TutorialApp: App {
 - 환경별 설정을 모듈에서 처리할 수 있습니다
 - `scope: .shared`는 앱 전체에서 하나의 인스턴스를 공유합니다
 
+#### 💡 스코프 완전 가이드
+
+Weaver는 5가지 직관적인 스코프를 제공합니다:
+
+```swift
+// 🔄 .shared: 앱 전체에서 하나의 인스턴스 공유 (싱글톤)
+await builder.register(DatabaseKey.self, scope: .shared) { _ in
+    CoreDataManager()
+}
+
+// 🧹 .weak: 약한 참조로 메모리 효율 관리
+await builder.registerWeak(ImageCacheKey.self) { _ in
+    ImageCache()
+}
+
+// 🚀 .startup: 앱 시작 시 즉시 로딩 (필수 서비스)
+await builder.register(LoggerKey.self, scope: .startup) { _ in
+    ProductionLogger()
+}
+
+// 💤 .whenNeeded: 실제 사용할 때만 로딩 (지연 로딩)
+await builder.register(CameraServiceKey.self, scope: .whenNeeded) { _ in
+    CameraService()
+}
+
+// 🔄 .transient: 매번 새로운 인스턴스 생성 (일회성)
+await builder.register(DataProcessorKey.self, scope: .transient) { _ in
+    DataProcessor()
+}
+```
+
 **🎉 초급 레벨 완료!** 이제 Weaver DI의 기본 개념을 완전히 이해했습니다.
 
 ---
@@ -2360,5 +2391,3 @@ struct RefreshTokenResponse: Codable {
     let expiresIn: Int
 }
 ```
-
-이제 튜토리얼의 나머지 고급 부분을 계속 작성하겠습니다.

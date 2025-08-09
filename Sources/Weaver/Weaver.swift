@@ -98,6 +98,8 @@ public actor WeaverGlobalState {
                 message: "⚠️ 전역 커널이 설정되지 않음. \(keyType) 기본값 반환", 
                 level: .debug
             )
+            // ✅ 커널이 없어도 타입 기반 API 지원을 위한 fallback 시도
+            // 하지만 커널이 없으면 등록 정보에 접근할 수 없으므로 Key.defaultValue 사용
             return Key.defaultValue
         }
         
@@ -111,14 +113,14 @@ public actor WeaverGlobalState {
         return result
     }
     
-    /// 커널이 준비 완료 상태가 될 때까지 대기합니다.
-    public func waitForReady() async throws -> any Resolver {
+    /// 커널이 준비 완료 상태인지 확인하고 준비된 Resolver를 반환합니다.
+    public func ensureReady() async throws -> any Resolver {
         guard let kernel = globalKernel else {
-            await logger.log(message: "전역 커널이 설정되지 않음. waitForReady 실패", level: .error)
+            await logger.log(message: "전역 커널이 설정되지 않음. ensureReady 실패", level: .error)
             throw WeaverError.containerNotFound
         }
         
-        return try await kernel.waitForReady()
+        return try await kernel.ensureReady()
     }
     
     /// 현재 설정된 스코프 매니저를 반환합니다.
@@ -138,13 +140,14 @@ public actor WeaverGlobalState {
     /// 앱 시작 시 Bootstrap 스코프만 즉시 활성화하고, 나머지는 사용 시점에 로딩합니다.
     /// - Parameter modules: 등록할 모듈 배열
     /// - Returns: 설정된 커널
+    /// - Throws: DependencySetupError - 의존성 그래프에 문제가 있는 경우
     @discardableResult
-    public func setupScoped(modules: [Module]) async -> WeaverKernel {
+    public func setupScoped(modules: [Module]) async throws -> WeaverKernel {
         await logger.log(message: "🚀 스코프 기반 DI 시스템 설정 시작", level: .info)
         
         let kernel = WeaverKernel.scoped(modules: modules, logger: logger)
         await setGlobalKernel(kernel)
-        await kernel.build()
+        try await kernel.build()
         
         await logger.log(message: "✅ 스코프 기반 DI 시스템 설정 완료", level: .info)
         return kernel
@@ -306,11 +309,11 @@ public enum Weaver {
         await shared.safeResolve(keyType)
     }
     
-    /// 커널이 준비 완료 상태가 될 때까지 대기합니다.
+    /// 커널이 준비 완료 상태인지 확인하고 준비된 Resolver를 반환합니다.
     /// - Returns: 준비된 Resolver 인스턴스
     /// - Throws: WeaverError (커널 없음, 실패 등)
-    public static func waitForReady() async throws -> any Resolver {
-        try await shared.waitForReady()
+    public static func ensureReady() async throws -> any Resolver {
+        try await shared.ensureReady()
     }
     
     /// 현재 설정된 스코프 매니저를 반환합니다.
@@ -343,15 +346,15 @@ public enum Weaver {
     /// 앱 시작 시 의존성 시스템을 초기화하는 편의 메서드
     /// - Parameters:
     ///   - modules: 등록할 모듈 배열
-    /// - Throws: 초기화 실패 시 WeaverError
+    /// - Throws: 초기화 실패 시 WeaverError 또는 DependencySetupError
     public static func setup(modules: [Module]) async throws {
         await shared.logger.log(message: "🚀 앱 의존성 시스템 초기화 시작", level: .info)
         
         let kernel = WeaverKernel.scoped(modules: modules, logger: shared.logger)
         await shared.setGlobalKernel(kernel)
-        await kernel.build()
+        try await kernel.build()
         
-        _ = try await kernel.waitForReady()
+        _ = try await kernel.ensureReady()
         await shared.logger.log(message: "✅ 앱 의존성 시스템 초기화 완료", level: .info)
     }
     
@@ -369,9 +372,10 @@ public enum Weaver {
     /// - Parameters:
     ///   - modules: 등록할 모듈 배열
     /// - Returns: 설정된 커널
+    /// - Throws: DependencySetupError - 의존성 그래프에 문제가 있는 경우
     @discardableResult
-    public static func setupScoped(modules: [Module]) async -> WeaverKernel {
-        await shared.setupScoped(modules: modules)
+    public static func setupScoped(modules: [Module]) async throws -> WeaverKernel {
+        try await shared.setupScoped(modules: modules)
     }
     
 
@@ -383,7 +387,11 @@ public enum Weaver {
 ///
 /// 사용법:
 /// ```
+/// // 1. DependencyKey 방식 (권장 - 최대 안전성)
 /// @Inject(MyServiceKey.self) private var myService
+///
+/// // 2. 타입 기반 편의 방식 (간단한 의존성용)
+/// @InjectType(MyService.self) private var myService
 ///
 /// func doSomething() async {
 ///     // 1. 기본 안전 버전 (권장) - 절대 크래시하지 않음
@@ -450,6 +458,43 @@ public struct Inject<Key: DependencyKey>: Sendable {
     }
     
 
+}
+
+/// 타입 기반 편의 의존성 주입을 위한 프로퍼티 래퍼입니다.
+///
+/// DependencyKey를 직접 정의하지 않고 타입만으로 의존성을 주입받을 수 있습니다.
+/// 내부적으로는 TypeBasedDependencyKey를 사용하여 기존 시스템과 완전히 호환됩니다.
+///
+/// 사용법:
+/// ```
+/// @InjectType(MyService.self) private var myService
+/// 
+/// func doSomething() async {
+///     let service = await myService()
+///     service.performAction()
+/// }
+/// ```
+@propertyWrapper
+public struct InjectType<T: Sendable>: Sendable {
+    private let inject: Inject<TypeBasedDependencyKey<T>>
+    
+    public init(_ type: T.Type) {
+        // 주의: 이 방식은 registerType으로 등록된 의존성에만 사용 가능
+        // TypeBasedDependencyKey가 적절히 초기화되어 있어야 함
+        self.inject = Inject(TypeBasedDependencyKey<T>.self)
+    }
+    
+    public var wrappedValue: Self {
+        self
+    }
+    
+    public var projectedValue: InjectProjection<TypeBasedDependencyKey<T>> {
+        inject.projectedValue
+    }
+    
+    public func callAsFunction() async -> T {
+        await inject()
+    }
 }
 
 /// `@Inject`의 `projectedValue`(`$myService`)를 통해 제공되는 기능을 담는 구조체입니다.

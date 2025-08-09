@@ -29,9 +29,9 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     
     // MARK: - State Management
     
-    private var _currentState: LifecycleState = .idle
+    private var currentLifecycleState: LifecycleState = .idle
     public var currentState: LifecycleState {
-        get async { _currentState }
+        get async { currentLifecycleState }
     }
     
     public let stateStream: AsyncStream<LifecycleState>
@@ -59,19 +59,25 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     
     // MARK: - LifecycleManager Implementation
     
-    public func build() async {
+    public func build() async throws {
         await updateState(.configuring)
         
-        // 1단계: 모든 모듈에서 등록 정보 수집
-        await collectRegistrations()
-        
-        // 2단계: Startup 스코프만 즉시 활성화
-        await activateScope(.startup)
-        
-        // 3단계: Ready 상태로 전환
-        await updateState(.ready(self))
-        
-        await logger.log(message: "✅ 커널 빌드 완료 - Startup 스코프 활성화됨", level: .info)
+        do {
+            // 1단계: 모든 모듈에서 등록 정보 수집
+            try await collectRegistrations()
+            
+            // 2단계: Startup 스코프만 즉시 활성화
+            try await activateScope(.startup)
+            
+            // 3단계: Ready 상태로 전환
+            await updateState(.ready(self))
+            
+            await logger.log(message: "✅ 커널 빌드 완료 - Startup 스코프 활성화됨", level: .info)
+        } catch {
+            await updateState(.failed(error))
+            await logger.log(message: "🚨 커널 빌드 실패: \(error.localizedDescription)", level: .error)
+            throw error
+        }
     }
     
     public func shutdown() async {
@@ -104,6 +110,15 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     public func safeResolve<Key: DependencyKey>(_ keyType: Key.Type) async -> Key.Value {
         // Preview 환경 처리
         if WeaverEnvironment.isPreview {
+            // Preview 환경에서도 타입 기반 API의 directDefaultValue 우선 사용
+            let key = AnyDependencyKey(keyType)
+            if let directDefault = await getDirectDefaultValue(for: key, as: Key.Value.self) {
+                await logger.log(
+                    message: "🎨 Preview 환경에서 타입 기반 등록의 기본값 사용: \(keyType)",
+                    level: .debug
+                )
+                return directDefault
+            }
             return Key.defaultValue
         }
         
@@ -112,28 +127,39 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
         } catch {
             await logger.logResolutionFailure(
                 keyName: String(describing: keyType),
-                currentState: _currentState,
+                currentState: currentLifecycleState,
                 error: error
             )
+            
+            // ✅ 타입 기반 편의 API 지원: directDefaultValue 우선 확인
+            let key = AnyDependencyKey(keyType)
+            if let directDefault = await getDirectDefaultValue(for: key, as: Key.Value.self) {
+                await logger.log(
+                    message: "🔄 Using direct default value for type-based registration: \(keyType)",
+                    level: .debug
+                )
+                return directDefault
+            }
+            
             return Key.defaultValue
         }
     }
     
     /// 커널이 준비 상태인지 확인하고 준비된 경우 resolver를 반환합니다.
-    /// 비동기 라이브러리에서는 대기하지 않고 즉시 상태를 확인합니다.
-    public func waitForReady() async throws -> any Resolver {
+    /// 준비되지 않은 경우 즉시 적절한 에러를 발생시킵니다.
+    public func ensureReady() async throws -> any Resolver {
         // 이미 준비된 경우
-        if case .ready(let resolver) = _currentState {
+        if case .ready(let resolver) = currentLifecycleState {
             return resolver
         }
         
         // shutdown 상태인 경우
-        if case .shutdown = _currentState {
+        if case .shutdown = currentLifecycleState {
             throw WeaverError.shutdownInProgress
         }
         
         // 실패 상태인 경우
-        if case .failed(let error) = _currentState {
+        if case .failed(let error) = currentLifecycleState {
             throw WeaverError.containerFailed(underlying: error)
         }
         
@@ -143,7 +169,7 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
         }
         
         // 준비되지 않은 상태
-        throw WeaverError.containerNotReady(currentState: _currentState)
+        throw WeaverError.containerNotReady(currentState: currentLifecycleState)
     }
     
     // MARK: - Resolver Implementation
@@ -151,29 +177,48 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     public func resolve<Key: DependencyKey>(_ keyType: Key.Type) async throws -> Key.Value {
         let key = AnyDependencyKey(keyType)
         
-        // 1. 어느 스코프에 등록되어 있는지 찾기
-        guard let targetScope = findScopeForKey(key) else {
-            throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
+        // 1. 먼저 등록된 스코프에서 해결 시도
+        if let targetScope = findScopeForKey(key) {
+            // 해당 스코프가 활성화되어 있지 않으면 활성화
+            if !activatedScopes.contains(targetScope) {
+                try await activateScope(targetScope)
+            }
+            
+            // 스코프 컨테이너에서 해결
+            if let container = scopeContainers[targetScope] {
+                return try await container.resolve(keyType)
+            }
         }
         
-        // 2. 해당 스코프가 활성화되어 있지 않으면 활성화
-        if !activatedScopes.contains(targetScope) {
-            await activateScope(targetScope)
+        // 2. 등록된 스코프에서 찾지 못한 경우, 활성화된 모든 스코프에서 우선순위 기반 검색
+        let searchOrder = getResolutionSearchOrder()
+        
+        for scope in searchOrder {
+            guard activatedScopes.contains(scope),
+                  let container = scopeContainers[scope] else {
+                continue
+            }
+            
+            do {
+                return try await container.resolve(keyType)
+            } catch WeaverError.resolutionFailed(.keyNotFound) {
+                // 이 스코프에서 찾지 못함, 다음 스코프 시도
+                continue
+            } catch {
+                // 다른 에러는 즉시 전파
+                throw error
+            }
         }
         
-        // 3. 스코프 컨테이너에서 해결
-        guard let container = scopeContainers[targetScope] else {
-            throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
-        }
-        
-        return try await container.resolve(keyType)
+        // 3. 모든 활성화된 스코프에서 찾지 못한 경우
+        throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
     }
     
     // MARK: - Scope Management
     
     /// 모든 모듈에서 등록 정보를 수집하고 스코프별로 분류합니다.
-    private func collectRegistrations() async {
-        await logger.log(message: "� 모실듈 등록 정보 수집 시작", level: .debug)
+    private func collectRegistrations() async throws {
+        await logger.log(message: "모듈 등록 정보 수집 시작", level: .debug)
         
         let builder = await WeaverContainer.builder().withLogger(logger)
         
@@ -182,9 +227,29 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             await module.configure(builder)
         }
         
-        // 등록 정보를 스코프별로 분류
+        // 🔧 [NEW] 빌드 타임 의존성 그래프 검증
         let allRegistrations = await builder.getRegistrations()
+        let dependencyGraph = DependencyGraph(registrations: allRegistrations)
+        let validation = dependencyGraph.validate()
         
+        switch validation {
+        case .valid:
+            await logger.log(message: "✅ 의존성 그래프 검증 완료", level: .debug)
+        case .circular(let cyclePath):
+            let error = DependencySetupError.circularDependency(cyclePath)
+            await logger.log(message: "🚨 순환 참조 감지: \(cyclePath.joined(separator: " → "))", level: .error)
+            throw error
+        case .missing(let missingDeps):
+            let error = DependencySetupError.missingDependencies(missingDeps)
+            await logger.log(message: "🚨 누락된 의존성: \(missingDeps.joined(separator: ", "))", level: .error)
+            throw error
+        case .invalid(let key, let underlyingError):
+            let error = DependencySetupError.invalidConfiguration(key, underlyingError)
+            await logger.log(message: "🚨 잘못된 설정: \(key) - \(underlyingError.localizedDescription)", level: .error)
+            throw error
+        }
+        
+        // 등록 정보를 스코프별로 분류
         for (key, registration) in allRegistrations {
             let scope = registration.scope
             if scopeRegistrations[scope] == nil {
@@ -200,7 +265,7 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     }
     
     /// 지정된 스코프를 활성화합니다.
-    private func activateScope(_ scope: Scope) async {
+    private func activateScope(_ scope: Scope) async throws {
         guard !activatedScopes.contains(scope) else {
             return // 이미 활성화됨
         }
@@ -211,7 +276,7 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
         let dependencies = getScopeDependencies(scope)
         for dependency in dependencies {
             if !activatedScopes.contains(dependency) {
-                await activateScope(dependency)
+                try await activateScope(dependency)
             }
         }
         
@@ -226,7 +291,7 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             .withLogger(logger)
             .withRegistrations(registrations)
         
-        let container = await builder.build { progress in
+        let container = try await builder.build { progress in
             await self.logger.log(
                 message: "📊 스코프 \(scope) 초기화 진행률: \(Int(progress * 100))%",
                 level: .debug
@@ -249,6 +314,39 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
         return nil
     }
     
+    /// 의존성 해결 시 스코프 검색 우선순위를 반환합니다.
+    /// 중요도가 높고 안정적인 스코프부터 검색합니다.
+    private func getResolutionSearchOrder() -> [Scope] {
+        return [
+            .startup,     // 1순위: 앱 필수 서비스
+            .shared,      // 2순위: 공유 서비스  
+            .whenNeeded,  // 3순위: 지연 로딩 서비스
+            .weak,        // 4순위: 약한 참조 서비스
+            .transient    // 5순위: 일회성 서비스 (실제로는 캐시되지 않으므로 검색 의미 없음)
+        ]
+    }
+    
+    /// 타입 기반 편의 API에서 제공된 직접 기본값을 찾아 반환합니다.
+    /// 타입 안전성을 보장하기 위해 캐스팅을 수행합니다.
+    private func getDirectDefaultValue<T>(for key: AnyDependencyKey, as targetType: T.Type) async -> T? {
+        // 모든 스코프에서 해당 키의 등록 정보 검색
+        for (_, registrations) in scopeRegistrations {
+            if let registration = registrations[key],
+               let directDefault = registration.directDefaultValue {
+                // 타입 안전한 캐스팅 시도
+                if let typedDefault = directDefault as? T {
+                    return typedDefault
+                } else {
+                    await logger.log(
+                        message: "⚠️ Direct default value type mismatch for \(key.description): expected \(targetType), got \(type(of: directDefault))",
+                        level: .error
+                    )
+                }
+            }
+        }
+        return nil
+    }
+    
     /// 스코프의 의존성을 반환합니다.
     private func getScopeDependencies(_ scope: Scope) -> [Scope] {
         switch scope {
@@ -260,14 +358,18 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             return [.startup] // startup에 의존
         case .weak:
             return [.startup] // startup에 의존
+        case .transient:
+            return [] // 독립적 - 다른 스코프에 의존하지 않음
         }
     }
     
     /// 스코프 종료 우선순위를 반환합니다 (높을수록 먼저 종료).
     private func getScopeShutdownPriority(_ scope: Scope) -> Int {
         switch scope {
+        case .transient:
+            return 4 // 가장 먼저 종료 (캐시되지 않으므로 실제로는 종료할 것이 없음)
         case .whenNeeded:
-            return 3 // 가장 먼저 종료
+            return 3
         case .shared:
             return 2
         case .weak:
@@ -280,8 +382,8 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     // MARK: - Helper Methods
     
     private func updateState(_ newState: LifecycleState) async {
-        let oldState = _currentState
-        _currentState = newState
+        let oldState = currentLifecycleState
+        currentLifecycleState = newState
         stateContinuation.yield(newState)
         
         await logger.logStateTransition(from: oldState, to: newState, reason: nil)
@@ -335,4 +437,3 @@ public enum CachePolicy: Sendable {
     case minimal
     case disabled
 }
-
