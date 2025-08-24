@@ -2,6 +2,7 @@
 
 import Foundation
 import os
+import _Concurrency
 
 // MARK: - ==================== 스코프 기반 점진적 로딩 커널 ====================
 //
@@ -26,6 +27,11 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     
     // 스코프별 등록 정보 캐시
     private var scopeRegistrations: [Scope: [AnyDependencyKey: DependencyRegistration]] = [:]
+    // 해석 가속화를 위한 키→스코프 인덱스 (PHASE2: O(1) 해상도)
+    private var keyScopeIndex: [ObjectIdentifier: Scope] = [:]
+    
+    // 병렬 초기화 코디네이터
+    private let startupCoordinator: StartupCoordinator
     
     // MARK: - State Management
     
@@ -45,6 +51,7 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     ) {
         self.modules = modules
         self.logger = logger
+        self.startupCoordinator = StartupCoordinator(logger: logger)
         
         // AsyncStream 설정
         var continuation: AsyncStream<LifecycleState>.Continuation!
@@ -73,9 +80,11 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             await updateState(.ready(self))
             
             await logger.log(message: "✅ 커널 빌드 완료 - Startup 스코프 활성화됨", level: .info)
+            
         } catch {
             await updateState(.failed(error))
             await logger.log(message: "🚨 커널 빌드 실패: \(error.localizedDescription)", level: .error)
+            
             throw error
         }
     }
@@ -107,41 +116,40 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     
     // MARK: - SafeResolver Implementation
     
+    /// 단순화된 safeResolve - DependencyValues 시스템과 통합
     public func safeResolve<Key: DependencyKey>(_ keyType: Key.Type) async -> Key.Value {
-        // Preview 환경 처리
-        if WeaverEnvironment.isPreview {
-            // Preview 환경에서도 타입 기반 API의 directDefaultValue 우선 사용
-            let key = AnyDependencyKey(keyType)
-            if let directDefault = await getDirectDefaultValue(for: key, as: Key.Value.self) {
-                await logger.log(
-                    message: "🎨 Preview 환경에서 타입 기반 등록의 기본값 사용: \(keyType)",
-                    level: .debug
-                )
-                return directDefault
-            }
-            return Key.defaultValue
+        // DependencyValues 시스템에 컨텍스트별 해결 위임
+        // 이리 인해 Preview/Test 환경 처리가 일관성 있게 수행됨
+        let currentContext = await DependencyValues.currentContext
+        
+        // Preview/Test 환경에서는 단순하게 컨텍스트 값 반환
+        if currentContext == .preview {
+            return keyType.previewValue
+        }
+        if currentContext == .test {
+            return keyType.testValue
         }
         
+        // Live 환경에서만 복잡한 의존성 해결 수행
         do {
             return try await resolve(keyType)
         } catch {
-            await logger.logResolutionFailure(
-                keyName: String(describing: keyType),
-                currentState: currentLifecycleState,
-                error: error
-            )
+            // 로깅 최소화
+            if WeaverEnvironment.isDevelopment {
+                await logger.logResolutionFailure(
+                    keyName: String(describing: keyType),
+                    currentState: currentLifecycleState,
+                    error: error
+                )
+            }
             
-            // ✅ 타입 기반 편의 API 지원: directDefaultValue 우선 확인
+            // 타입 기반 API 지원
             let key = AnyDependencyKey(keyType)
             if let directDefault = await getDirectDefaultValue(for: key, as: Key.Value.self) {
-                await logger.log(
-                    message: "🔄 Using direct default value for type-based registration: \(keyType)",
-                    level: .debug
-                )
                 return directDefault
             }
             
-            return Key.defaultValue
+            return keyType.liveValue
         }
     }
     
@@ -175,43 +183,22 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     // MARK: - Resolver Implementation
     
     public func resolve<Key: DependencyKey>(_ keyType: Key.Type) async throws -> Key.Value {
-        let key = AnyDependencyKey(keyType)
-        
-        // 1. 먼저 등록된 스코프에서 해결 시도
-        if let targetScope = findScopeForKey(key) {
-            // 해당 스코프가 활성화되어 있지 않으면 활성화
-            if !activatedScopes.contains(targetScope) {
-                try await activateScope(targetScope)
-            }
-            
-            // 스코프 컨테이너에서 해결
-            if let container = scopeContainers[targetScope] {
-                return try await container.resolve(keyType)
-            }
+        let keyId = ObjectIdentifier(keyType)
+        guard let scope = keyScopeIndex[keyId] else {
+            throw WeaverError.resolutionFailed(.keyNotFound(keyName: String(describing: keyType)))
         }
         
-        // 2. 등록된 스코프에서 찾지 못한 경우, 활성화된 모든 스코프에서 우선순위 기반 검색
-        let searchOrder = getResolutionSearchOrder()
+        // 스코프가 비활성 상태일 경우 안전하게 활성화합니다.
+        try await activateScope(scope)
         
-        for scope in searchOrder {
-            guard activatedScopes.contains(scope),
-                  let container = scopeContainers[scope] else {
-                continue
-            }
-            
-            do {
-                return try await container.resolve(keyType)
-            } catch WeaverError.resolutionFailed(.keyNotFound) {
-                // 이 스코프에서 찾지 못함, 다음 스코프 시도
-                continue
-            } catch {
-                // 다른 에러는 즉시 전파
-                throw error
-            }
+        // 활성화된 스코프의 컨테이너에서 의존성을 해결합니다.
+        guard let container = scopeContainers[scope] else {
+            // activateScope가 성공했다면 이 경로는 실행되지 않아야 합니다.
+            // 이는 시스템의 내부 상태가 일관되지 않음을 의미하므로, 런타임 에러를 발생시켜 즉시 문제를 파악하도록 합니다.
+            fatalError("Weaver Internal Inconsistency: Scope '\(scope)' was activated, but its container is missing.")
         }
         
-        // 3. 모든 활성화된 스코프에서 찾지 못한 경우
-        throw WeaverError.resolutionFailed(.keyNotFound(keyName: key.description))
+        return try await container.resolve(keyType)
     }
     
     // MARK: - Scope Management
@@ -249,13 +236,18 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             throw error
         }
         
-        // 등록 정보를 스코프별로 분류
+        // 등록 정보를 스코프별로 분류 + 키→스코프 인덱스 구성
+        keyScopeIndex.removeAll(keepingCapacity: true)
         for (key, registration) in allRegistrations {
             let scope = registration.scope
             if scopeRegistrations[scope] == nil {
                 scopeRegistrations[scope] = [:]
             }
             scopeRegistrations[scope]![key] = registration
+            
+            // PHASE2: 키 -> 스코프 인덱스 빌드
+            let keyId = ObjectIdentifier(key.keyType)
+            keyScopeIndex[keyId] = scope
         }
         
         await logger.log(
@@ -265,6 +257,7 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
     }
     
     /// 지정된 스코프를 활성화합니다.
+    /// startup 스코프의 경우 병렬 초기화를 수행합니다.
     private func activateScope(_ scope: Scope) async throws {
         guard !activatedScopes.contains(scope) else {
             return // 이미 활성화됨
@@ -291,27 +284,75 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
             .withLogger(logger)
             .withRegistrations(registrations)
         
-        let container = try await builder.build { progress in
-            await self.logger.log(
-                message: "📊 스코프 \(scope) 초기화 진행률: \(Int(progress * 100))%",
-                level: .debug
+        // startup 스코프의 경우 병렬 초기화 진행률 추적
+        if scope == .startup {
+            let container = try await builder.build()
+
+            // startup 스코프 병렬 초기화 실행
+            await logger.log(message: "🔄 startup 스코프 병렬 초기화 시작", level: .info)
+
+            let result = await startupCoordinator.initializeStartupServices(
+                registrations: registrations,
+                container: container
             )
+
+            // 병렬 초기화 결과 처리
+            switch result {
+            case .success(let metrics):
+                await logger.log(
+                    message: "✅ startup 병렬 초기화 성공 - \(String(format: "%.2f", metrics.totalStartupTime * 1000))ms, 효율성: \(String(format: "%.1f", metrics.parallelizationEfficiency * 100))%",
+                    level: .info
+                )
+
+                // 상세 메트릭 로깅 (개발 환경에서만)
+                if WeaverEnvironment.isDevelopment {
+                    await logger.log(
+                        message:
+                          "📈 병렬 초기화 메트릭 - " +
+                          "계층: \(metrics.layersCount), " +
+                          "서비스: \(metrics.servicesCount), " +
+                          "병렬효율: \(Int(metrics.parallelizationEfficiency * 100))%, " +
+                          "총: \(metrics.totalStartupTime)s / 순차: \(metrics.serializedTime)s",
+                        level: .debug
+                    )
+                }
+
+            case .partialFailure(let successful, let failed, let metrics):
+                await logger.log(
+                    message: "⚠️ startup 부분 초기화 실패 - 성공: \(successful.count), 실패: \(failed.count), 시간: \(String(format: "%.2f", metrics.totalStartupTime * 1000))ms",
+                    level: .error
+                )
+
+                // 실패한 서비스들 로깅
+                for (key, error) in failed {
+                    await logger.log(
+                        message: "❌ 서비스 초기화 실패: \(key.description) - \(error.localizedDescription)",
+                        level: .error
+                    )
+                }
+
+                // 부분 실패는 에러로 전파하지 않고 계속 진행
+                // (핵심이 아닌 서비스의 실패로 전체 앱이 시작되지 않는 것을 방지)
+
+            case .failure(let error, let metrics):
+                await logger.log(
+                    message: "🚨 startup 병렬 초기화 실패: \(error.localizedDescription) (시간: \(String(format: "%.2f", metrics.totalStartupTime * 1000))ms)",
+                    level: .error
+                )
+                throw error
+            }
+
+            scopeContainers[scope] = container
+
+        } else {
+            // 다른 스코프는 기존 방식으로 초기화
+            let container = try await builder.build()
+            scopeContainers[scope] = container
         }
         
-        scopeContainers[scope] = container
         activatedScopes.insert(scope)
         
         await logger.log(message: "✅ 스코프 활성화 완료: \(scope)", level: .debug)
-    }
-    
-    /// 키가 어느 스코프에 등록되어 있는지 찾습니다.
-    private func findScopeForKey(_ key: AnyDependencyKey) -> Scope? {
-        for (scope, registrations) in scopeRegistrations {
-            if registrations[key] != nil {
-                return scope
-            }
-        }
-        return nil
     }
     
     /// 의존성 해결 시 스코프 검색 우선순위를 반환합니다.
@@ -391,7 +432,6 @@ public actor WeaverKernel: WeaverKernelProtocol, Resolver {
 }
 
 // MARK: - ==================== 편의 생성자 ====================
-
 public extension WeaverKernel {
     /// 스코프 기반 커널을 생성합니다.
     static func scoped(modules: [Module], logger: WeaverLogger = DefaultLogger()) -> WeaverKernel {
@@ -400,7 +440,6 @@ public extension WeaverKernel {
 }
 
 // MARK: - ==================== 앱 생명주기 이벤트 ====================
-
 /// 앱 생명주기 이벤트를 나타내는 열거형입니다.
 public enum AppLifecycleEvent: String, Sendable {
     case didEnterBackground
@@ -429,7 +468,6 @@ public extension AppLifecycleAware {
 }
 
 // MARK: - ==================== 캐시 정책 ====================
-
 /// 캐시 정책을 정의하는 열거형입니다.
 public enum CachePolicy: Sendable {
     case `default`

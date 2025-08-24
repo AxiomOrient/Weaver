@@ -9,14 +9,15 @@ public actor WeakBox<T: AnyObject & Sendable>: Sendable {
     // MARK: - Properties
     
     private weak var _value: T?
-    private let creationTime: CFAbsoluteTime
+    private let clock = ContinuousClock()
+    private let creationTime: ContinuousClock.Instant
     private let typeDescription: String
     
     // MARK: - Initialization
     
     public init(_ value: T) {
         self._value = value
-        self.creationTime = CFAbsoluteTimeGetCurrent()
+        self.creationTime = clock.now
         self.typeDescription = String(describing: type(of: value))
     }
     
@@ -34,7 +35,9 @@ public actor WeakBox<T: AnyObject & Sendable>: Sendable {
     
     /// 생성 이후 경과 시간
     public var age: TimeInterval {
-        CFAbsoluteTimeGetCurrent() - creationTime
+        let duration = clock.now - creationTime
+        let comps = duration.components
+        return Double(comps.seconds) + Double(comps.attoseconds) / 1_000_000_000_000_000_000.0
     }
     
     /// 디버깅을 위한 설명

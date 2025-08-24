@@ -208,7 +208,7 @@ public actor WeaverBuilder {
     factory: @escaping @Sendable (Resolver) async throws -> T
   ) -> Self {
     // 타입 기반 키 생성
-    let key = AnyDependencyKey(TypeBasedDependencyKey<T>.self)
+    let key = AnyDependencyKey(T.self)
     
     // directDefaultValue를 포함한 등록 정보 생성
     registrations[key] = DependencyRegistration(
@@ -229,7 +229,7 @@ public actor WeaverBuilder {
     defaultValue: T,
     factory: @escaping @Sendable (Resolver) async throws -> T
   ) -> Self {
-    let key = AnyDependencyKey(TypeBasedDependencyKey<T>.self)
+    let key = AnyDependencyKey(T.self)
     
     registrations[key] = DependencyRegistration(
       scope: .weak,
@@ -273,10 +273,10 @@ public actor WeaverBuilder {
   /// 앱 서비스 초기화 진행률 콜백을 지원하는 `build` 메서드입니다.
   /// `WeaverKernel`에서 이 메서드를 호출하여 컨테이너 초기화 진행 상태를 외부에 알립니다.
   /// 빌드 타임에 의존성 그래프를 검증하여 순환 참조와 누락된 의존성을 감지합니다.
-  /// - Parameter onAppServiceProgress: 앱 서비스 초기화 진행률(0.0 ~ 1.0)을 전달받는 비동기 클로저.
+  /// - Parameter onAppServiceProgress: 앱 서비스 초기화 진행률(0.0 ~ 1.0)을 전달받는 동기 클로저.
   /// - Returns: 설정이 완료된 새로운 `WeaverContainer` 인스턴스.
   /// - Throws: DependencySetupError - 의존성 그래프에 문제가 있는 경우
-  public func build(onAppServiceProgress: @escaping @Sendable (Double) async -> Void) async throws
+  public func build(onAppServiceProgress: @escaping @Sendable (Double) -> Void) async throws
     -> WeaverContainer
   {
     // 1. 모듈 설정을 먼저 적용합니다.

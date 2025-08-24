@@ -11,6 +11,13 @@
 import Foundation
 import os
 
+// MARK: - Time Utilities (ContinuousClock)
+@inline(__always)
+private func _seconds(_ d: Duration) -> TimeInterval {
+    let comps = d.components
+    return Double(comps.seconds) + Double(comps.attoseconds) / 1_000_000_000_000_000_000.0
+}
+
 /// 의존성 해결을 담당하는 핵심 컨테이너
 public actor WeaverContainer: Resolver {
 
@@ -64,18 +71,44 @@ public actor WeaverContainer: Resolver {
       throw WeaverError.resolutionFailed(.containerShutdown)
     }
 
-    let startTime = CFAbsoluteTimeGetCurrent()
+    let clock = ContinuousClock()
+    let startTime = clock.now
 
     do {
       let instance = try await resolutionCoordinator.resolve(keyType)
 
-      let duration = CFAbsoluteTimeGetCurrent() - startTime
-      await metricsCollector.recordResolution(duration: duration)
+      let duration = clock.now - startTime
+      await metricsCollector.recordResolution(duration: _seconds(duration))
 
       return instance
     } catch {
-      let duration = CFAbsoluteTimeGetCurrent() - startTime
-      await metricsCollector.recordResolution(duration: duration)
+      let duration = clock.now - startTime
+      await metricsCollector.recordResolution(duration: _seconds(duration))
+      await metricsCollector.recordFailure()
+      throw error
+    }
+  }
+
+  /// AnyDependencyKey를 사용하여 의존성을 해결합니다.
+  /// StartupCoordinator에서 병렬 초기화를 위해 사용됩니다.
+  public func resolveAny(_ key: AnyDependencyKey) async throws {
+    // Shutdown 상태 체크
+    guard !isShutdown else {
+      throw WeaverError.resolutionFailed(.containerShutdown)
+    }
+    
+    let clock = ContinuousClock()
+    let startTime = clock.now
+    
+    do {
+      _ = try await resolutionCoordinator.resolveAny(key)
+      
+      let duration = clock.now - startTime
+      await metricsCollector.recordResolution(duration: _seconds(duration))
+      
+    } catch {
+      let duration = clock.now - startTime
+      await metricsCollector.recordResolution(duration: _seconds(duration))
       await metricsCollector.recordFailure()
       throw error
     }
@@ -145,21 +178,21 @@ public actor WeaverContainer: Resolver {
   /// AppService 스코프의 의존성들을 앱 상태 변화에 대응할 수 있도록 초기화합니다.
   /// 의존성 순서를 보장하여 순차적으로 초기화합니다.
   public func initializeAppServiceDependencies(
-    onProgress: @escaping @Sendable (Double) async -> Void
+    onProgress: @escaping @Sendable (Double) -> Void
   ) async {
     let appServiceKeys = registrations.filter { 
       // startup 스코프의 서비스들을 앱 서비스로 간주
       $1.scope == Scope.startup 
     }.map { $0.key }
     guard !appServiceKeys.isEmpty else {
-      await onProgress(1.0)
+      onProgress(1.0)
       return
     }
 
     await logger?.log(
       message: "🚀 Initializing \(appServiceKeys.count) app services in priority order...",
       level: .info)
-    await onProgress(0.0)
+    onProgress(0.0)
 
     let totalCount = appServiceKeys.count
 
@@ -206,7 +239,7 @@ public actor WeaverContainer: Resolver {
 
       // 진행률 업데이트 (순차 처리로 정확한 진행률 보장)
       let progress = Double(index + 1) / Double(totalCount)
-      await onProgress(progress)
+      onProgress(progress)
     }
 
     // 초기화 결과 요약 로깅
@@ -227,7 +260,7 @@ public actor WeaverContainer: Resolver {
     }
 
     // 최종 진행률 업데이트 보장
-    await onProgress(1.0)
+    onProgress(1.0)
 
     // 초기화 완료 요약 및 성능 메트릭
     let successCount = totalCount - failedServices.count
@@ -618,24 +651,20 @@ actor ResolutionCoordinator: Resolver {
   }
 
   private func setupWeakReference(key: AnyDependencyKey, instance: any Sendable) throws {
-    // 약한 참조는 클래스 타입만 가능하므로 AnyObject 체크
-    // 실제로는 struct나 enum 타입의 Sendable도 있으므로 체크가 필요하지만
-    // 현재 Swift 컴파일러는 모든 Sendable을 AnyObject로 캐스팅 가능하다고 판단
-    // 따라서 런타임에서 실제 클래스 타입인지 확인
-    guard type(of: instance) is AnyClass else {
-      throw WeaverError.resolutionFailed(
-        .typeMismatch(
-          expected: "AnyObject (class type)",
-          actual: "\(type(of: instance))",
-          keyName: key.description
-        )
-      )
+    // 클래스(참조 타입)인지 먼저 확인한다.
+    guard let anyObject = instance as AnyObject? else {
+      throw WeaverError.resolutionFailed(.typeMismatch(
+        expected: "AnyObject",
+        actual: "\(type(of: instance))",
+        keyName: key.description
+      ))
     }
 
-    // instance는 이미 Sendable이고, 클래스 타입 체크를 통과했으므로
-    // 둘 다 만족하는 타입으로 안전하게 캐스팅
-    let sendableObject = instance as! (any AnyObject & Sendable)
-    let weakBox = WeakBox(sendableObject)
+    // ⚠️ Sendable은 마커 프로토콜이라 런타임 조건부 캐스트(as?)가 불가하다.
+    // 우리 라이브러리의 계약상 DependencyKey.Value는 컴파일 타임에 이미 `Sendable`을 만족해야 한다.
+    // 따라서 여기서는 참조 타입 성질만 런타임 확인하고, Sendable은 API 계약에 근거해 신뢰한다.
+    let obj = unsafeBitCast(anyObject, to: (AnyObject & Sendable).self)
+    let weakBox = WeakBox(obj)
     weakReferences[key] = weakBox
   }
 }
@@ -1189,18 +1218,19 @@ extension ResolutionCoordinator {
 extension WeaverContainer {
   /// AnyDependencyKey를 직접 해결하는 내부 메서드
   func resolve(_ key: AnyDependencyKey) async throws -> any Sendable {
-    let startTime = CFAbsoluteTimeGetCurrent()
+    let clock = ContinuousClock()
+    let startTime = clock.now
 
     do {
       let instance = try await resolutionCoordinator.resolveAny(key)
 
-      let duration = CFAbsoluteTimeGetCurrent() - startTime
-      await metricsCollector.recordResolution(duration: duration)
+      let duration = clock.now - startTime
+      await metricsCollector.recordResolution(duration: _seconds(duration))
 
       return instance
     } catch {
-      let duration = CFAbsoluteTimeGetCurrent() - startTime
-      await metricsCollector.recordResolution(duration: duration)
+      let duration = clock.now - startTime
+      await metricsCollector.recordResolution(duration: _seconds(duration))
       await metricsCollector.recordFailure()
       throw error
     }

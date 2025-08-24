@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "Weaver",
     platforms: [
-        .iOS(.v15),
+        .iOS(.v16),
         .watchOS(.v8),
         .macOS(.v13)
     ],

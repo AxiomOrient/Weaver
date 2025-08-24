@@ -6,15 +6,46 @@ import os
 // MARK: - ==================== Core Public Protocols ====================
 // 애플리케이션 개발자가 주로 사용하게 될 핵심 프로토콜입니다.
 
+public enum DependencyContext: Sendable { case live, preview, test }
+
+
 /// 의존성을 정의하는 키(Key) 타입에 대한 프로토콜입니다.
-/// 모든 의존성 키는 이 프로토콜을 준수해야 하며, 의존성의 타입과 기본값을 정의합니다.
+/// 모든 의존성 키는 이 프로토콜을 준수해야 하며, 의존성의 타입과 컨텍스트별 값을 정의합니다.
 public protocol DependencyKey: Sendable {
     /// 의존성으로 등록될 값의 타입입니다.
     associatedtype Value: Sendable
     
+    /// 프로덕션 환경에서 사용되는 실제 구현체입니다.
+    /// 네트워크 호출, 파일 시스템 접근 등 실제 외부 리소스를 사용합니다.
+    static var liveValue: Value { get }
+    
+    /// SwiftUI Preview 환경에서 사용되는 Mock 구현체입니다.
+    /// Preview가 빠르게 렌더링될 수 있도록 가벼운 구현을 제공합니다.
+    static var previewValue: Value { get }
+    
+    /// 테스트 환경에서 사용되는 테스트용 구현체입니다.
+    /// 예측 가능하고 제어 가능한 동작을 제공하여 안정적인 테스트를 지원합니다.
+    static var testValue: Value { get }
+    
     /// 의존성을 해결할 수 없을 때 사용될 안전한 기본값입니다.
-    /// SwiftUI Preview 또는 테스트 환경에서 유용하게 사용될 수 있습니다.
+    /// 기존 호환성을 위해 유지되며, liveValue를 기본으로 사용합니다.
+    @available(*, deprecated, message: "Use liveValue, previewValue, or testValue instead")
     static var defaultValue: Value { get }
+}
+
+// MARK: - DependencyKey Default Implementation
+
+/// DependencyKey의 기본 구현을 제공합니다.
+/// 기존 defaultValue를 기반으로 자동으로 컨텍스트별 값을 생성합니다.
+public extension DependencyKey {
+    /// 기본값은 liveValue를 사용합니다.
+    static var defaultValue: Value { liveValue }
+    
+    /// previewValue가 구현되지 않은 경우 liveValue를 사용합니다.
+    static var previewValue: Value { liveValue }
+    
+    /// testValue가 구현되지 않은 경우 liveValue를 사용합니다.
+    static var testValue: Value { liveValue }
 }
 
 /// 의존성을 해결(resolve)하는 기능을 정의하는 프로토콜입니다.
@@ -120,7 +151,7 @@ public protocol SafeResolver: Sendable {
 
 /// 두 프로토콜을 조합하여 완전한 커널 기능을 제공하는 프로토콜입니다.
 /// SwiftUI를 사용하지 않는 환경(UIKit, AppKit, Server-side)에서 DI 컨테이너를 제어하는 표준 진입점 역할을 합니다.
-public protocol WeaverKernelProtocol: LifecycleManager, SafeResolver {
+public protocol WeaverKernelProtocol: LifecycleManager, SafeResolver, Resolver {
     // 조합으로 기능 제공, 추가 메서드 없음
 }
 
@@ -196,6 +227,16 @@ public protocol CacheManaging: Sendable {
 
 // MARK: - ==================== Utility Types ====================
 
+/// 내부 전용 자동 생성 키. 타입 기반 등록 시 사용됩니다.
+internal enum _AutoKey<T: Sendable>: DependencyKey {
+    typealias Value = T
+    static var liveValue: T { fatalError("_AutoKey is internal and must not be resolved directly.") }
+    static var previewValue: T { liveValue }
+    static var testValue: T { liveValue }
+    @available(*, deprecated)
+    static var defaultValue: T { liveValue }
+}
+
 /// 타입 소거된 DependencyKey를 나타내는 구조체입니다.
 /// 의존성 그래프 분석과 런타임 키 관리에 사용됩니다.
 public struct AnyDependencyKey: Hashable, Sendable, CustomStringConvertible {
@@ -205,6 +246,11 @@ public struct AnyDependencyKey: Hashable, Sendable, CustomStringConvertible {
     public init<Key: DependencyKey>(_ keyType: Key.Type) {
         self._keyType = keyType
         self._description = String(describing: keyType)
+    }
+
+    public init<T: Sendable>(_ valueType: T.Type) {
+        self._keyType = _AutoKey<T>.self
+        self._description = String(describing: valueType)
     }
     
     public var description: String {
@@ -430,6 +476,140 @@ public struct DependencyGraph: Sendable {
         return dependencyMap
     }
     
+    /// startup 스코프 서비스들의 초기화 계층을 계산합니다.
+    /// 각 계층의 서비스들은 서로 독립적이므로 병렬로 초기화할 수 있습니다.
+    public func calculateInitializationLayers() -> [Set<AnyDependencyKey>] {
+        let startupServices = registrations.filter { _, registration in
+            registration.scope == .startup
+        }.map { $0.key }
+        
+        guard !startupServices.isEmpty else {
+            return []
+        }
+        
+        var layers: [Set<AnyDependencyKey>] = []
+        var processedServices: Set<AnyDependencyKey> = []
+        var remainingServices = Set(startupServices)
+        
+        while !remainingServices.isEmpty {
+            var currentLayer: Set<AnyDependencyKey> = []
+            
+            // 현재 계층에 포함될 수 있는 서비스들 찾기
+            // (의존성이 모두 이전 계층에서 처리된 서비스들)
+            for service in remainingServices {
+                let dependencies = dependencyMap[service] ?? []
+                let startupDependencies = dependencies.filter { dep in
+                    registrations[dep]?.scope == .startup
+                }
+                
+                // 모든 startup 의존성이 이미 처리되었으면 현재 계층에 포함
+                if startupDependencies.allSatisfy({ processedServices.contains($0) }) {
+                    currentLayer.insert(service)
+                }
+            }
+            
+            // 더 이상 처리할 수 있는 서비스가 없으면 순환 참조 가능성
+            guard !currentLayer.isEmpty else {
+                // 남은 서비스들을 모두 마지막 계층에 포함 (순환 참조 상황에서 최선의 노력)
+                layers.append(remainingServices)
+                break
+            }
+            
+            layers.append(currentLayer)
+            processedServices.formUnion(currentLayer)
+            remainingServices.subtract(currentLayer)
+        }
+        
+        return layers
+    }
+    
+    /// startup 스코프 서비스들의 병렬화 가능성을 분석합니다.
+    /// 이론적 최대 병렬화 효과와 병목 지점을 식별합니다.
+    public func analyzeStartupParallelizationPotential() -> StartupAnalysisResult {
+        let layers = calculateInitializationLayers()
+        
+        guard !layers.isEmpty else {
+            return StartupAnalysisResult(
+                totalServices: 0,
+                layersCount: 0,
+                maxParallelizableServices: 0,
+                bottleneckLayers: [],
+                estimatedSpeedup: 1.0,
+                criticalPath: []
+            )
+        }
+        
+        let totalServices = layers.reduce(0) { $0 + $1.count }
+        let maxParallelizableServices = layers.map { $0.count }.max() ?? 0
+        
+        // 병목 계층 식별 (서비스가 1개뿐인 계층들)
+        let bottleneckLayers = layers.enumerated().compactMap { index, services in
+            services.count == 1 ? index : nil
+        }
+        
+        // 이론적 속도향상 계산 (순차 실행 대비 병렬 실행)
+        let serialTime = Double(totalServices) // 각 서비스가 1단위 시간이라고 가정
+        let parallelTime = Double(layers.count) // 계층 수만큼 시간 소요
+        let estimatedSpeedup = serialTime / parallelTime
+        
+        // 임계 경로 계산 (가장 긴 의존성 체인)
+        let criticalPath = findCriticalPath()
+        
+        return StartupAnalysisResult(
+            totalServices: totalServices,
+            layersCount: layers.count,
+            maxParallelizableServices: maxParallelizableServices,
+            bottleneckLayers: bottleneckLayers,
+            estimatedSpeedup: estimatedSpeedup,
+            criticalPath: criticalPath
+        )
+    }
+    
+    /// 가장 긴 의존성 체인(임계 경로)을 찾습니다.
+    private func findCriticalPath() -> [AnyDependencyKey] {
+        let startupServices = Set(registrations.filter { $0.value.scope == .startup }.keys)
+        var longestPath: [AnyDependencyKey] = []
+        
+        // 각 startup 서비스에서 시작하는 의존성 체인을 계산
+        for service in startupServices {
+            let path = calculateDependencyChain(from: service, visited: [])
+            if path.count > longestPath.count {
+                longestPath = path
+            }
+        }
+        
+        return longestPath
+    }
+    
+    /// 특정 서비스에서 시작하는 의존성 체인을 계산합니다.
+    private func calculateDependencyChain(from service: AnyDependencyKey, visited: [AnyDependencyKey]) -> [AnyDependencyKey] {
+        // 순환 참조 방지
+        if visited.contains(service) {
+            return visited
+        }
+        
+        let newVisited = visited + [service]
+        let dependencies = dependencyMap[service] ?? []
+        let startupDependencies = dependencies.filter { dep in
+            registrations[dep]?.scope == .startup
+        }
+        
+        if startupDependencies.isEmpty {
+            return newVisited
+        }
+        
+        // 가장 긴 의존성 체인 찾기
+        var longestChain = newVisited
+        for dependency in startupDependencies {
+            let chain = calculateDependencyChain(from: dependency, visited: newVisited)
+            if chain.count > longestChain.count {
+                longestChain = chain
+            }
+        }
+        
+        return longestChain
+    }
+    
     /// 의존성 그래프를 시각화하기 위한 DOT 형식 출력
     public func generateDotGraph() -> String {
         var dot = "digraph DependencyGraph {\n"
@@ -469,6 +649,38 @@ public struct DependencyGraph: Sendable {
     }
 }
 
+/// startup 스코프 병렬화 분석 결과
+public struct StartupAnalysisResult: Sendable {
+    /// 전체 startup 서비스 개수
+    public let totalServices: Int
+    /// 초기화 계층의 개수
+    public let layersCount: Int
+    /// 한 번에 병렬 실행 가능한 최대 서비스 개수
+    public let maxParallelizableServices: Int
+    /// 병목 지점이 되는 계층들의 인덱스
+    public let bottleneckLayers: [Int]
+    /// 이론적 속도 향상 배수 (순차 실행 대비)
+    public let estimatedSpeedup: Double
+    /// 임계 경로 (가장 긴 의존성 체인)
+    public let criticalPath: [AnyDependencyKey]
+    
+    public init(
+        totalServices: Int,
+        layersCount: Int,
+        maxParallelizableServices: Int,
+        bottleneckLayers: [Int],
+        estimatedSpeedup: Double,
+        criticalPath: [AnyDependencyKey]
+    ) {
+        self.totalServices = totalServices
+        self.layersCount = layersCount
+        self.maxParallelizableServices = maxParallelizableServices
+        self.bottleneckLayers = bottleneckLayers
+        self.estimatedSpeedup = estimatedSpeedup
+        self.criticalPath = criticalPath
+    }
+}
+
 /// 스코프 호환성 에러
 public struct ScopeCompatibilityError: Error, LocalizedError {
     let consumer: Scope
@@ -486,27 +698,11 @@ public struct ScopeCompatibilityError: Error, LocalizedError {
 /// 이 구조체는 개발자가 DependencyKey를 직접 정의하지 않고도
 /// 타입만으로 의존성을 등록할 수 있도록 지원합니다.
 /// 기존 DependencyKey 방식과 완전히 호환되며, 안전성을 해치지 않습니다.
-public struct TypeBasedDependencyKey<T: Sendable>: DependencyKey {
+public struct TypeBasedDependencyKey<T: Sendable>: Sendable {
     public typealias Value = T
-    
-    /// 인스턴스별로 기본값을 저장
     private let _defaultValue: T
-    
-    public static var defaultValue: T {
-        // 타입 기반 API는 registerType과 함께 사용되어야 하므로
-        // 직접 접근 시에는 적절한 에러 메시지 제공
-        fatalError("TypeBasedDependencyKey for \(T.self) should be used with registerType method. Use DependencyKey protocol directly for manual registration.")
-    }
-    
-    /// 기본값과 함께 키를 초기화합니다
-    public init(defaultValue: T) {
-        self._defaultValue = defaultValue
-    }
-    
-    /// 인스턴스의 기본값을 반환합니다
-    public var instanceDefaultValue: T {
-        return _defaultValue
-    }
+    public init(defaultValue: T) { self._defaultValue = defaultValue }
+    public var instanceDefaultValue: T { _defaultValue }
 }
 
 /// 환경 관련 유틸리티를 제공하는 네임스페이스입니다.
