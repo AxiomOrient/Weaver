@@ -3,14 +3,29 @@
 import Foundation
 
 public actor DependencyContainer: DependencyResolver {
-    private final class WeakEntry {
+    private final class WeakReference {
         weak var object: AnyObject?
         init(_ object: AnyObject) { self.object = object }
     }
 
+    private struct CachedSingleton: Sendable {
+        private let storage: any Sendable
+        private let type: Any.Type
+
+        init<Value: Sendable>(_ value: Value) {
+            self.storage = value
+            self.type = Value.self
+        }
+
+        func value<Value>(as _: Value.Type) -> Value? {
+            guard Value.self == type else { return nil }
+            return storage as? Value
+        }
+    }
+
     private enum CacheEntry {
-        case singleton(provider: @Sendable () -> any Sendable)
-        case weak(WeakEntry)
+        case singleton(CachedSingleton)
+        case weak(WeakReference)
     }
 
     private let registrations: [AnyDependencyKey: DependencyRegistration]
@@ -23,7 +38,7 @@ public actor DependencyContainer: DependencyResolver {
     public init(
         registrations: [AnyDependencyKey: DependencyRegistration],
         parent: DependencyContainer? = nil,
-        logger: DependencyLogger = DefaultDependencyLogger()
+        logger: DependencyLogger = DefaultDependencyLogger.shared
     ) {
         self.registrations = registrations
         self.parent = parent
@@ -59,8 +74,8 @@ public actor DependencyContainer: DependencyResolver {
         as _: Key.Type
     ) async -> Key.Value? {
         switch cache[key] {
-        case .singleton(let provider):
-            return provider() as? Key.Value
+        case .singleton(let cached):
+            return cached.value(as: Key.Value.self)
         case .weak(let entry):
             if let object = entry.object as? Key.Value {
                 return object
@@ -112,12 +127,12 @@ public actor DependencyContainer: DependencyResolver {
     ) async throws {
         switch lifetime {
         case .singleton:
-            cache[key] = .singleton(provider: { value })
+            cache[key] = .singleton(CachedSingleton(value))
         case .weakReference:
-            guard let object = value as? AnyObject else {
+            guard let object = (value as AnyObject?) else {
                 throw DependencyError.weakNonObject(key: key.description)
             }
-            cache[key] = .weak(WeakEntry(object))
+            cache[key] = .weak(WeakReference(object))
         case .transient:
             cache.removeValue(forKey: key)
         }

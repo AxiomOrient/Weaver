@@ -68,6 +68,7 @@ public protocol DependencyLogger: Sendable {
 }
 
 public actor DefaultDependencyLogger: DependencyLogger {
+    public nonisolated static let shared = DefaultDependencyLogger()
     private let logger = Logger(subsystem: "com.weaver.di", category: "Dependency")
 
     public init() {}

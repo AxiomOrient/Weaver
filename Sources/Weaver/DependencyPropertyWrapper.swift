@@ -21,7 +21,8 @@ public struct DependencyValue<Key: DependencyKey>: Sendable {
             try await Dependency.resolve(key)
         }
 
-        public func require() async throws -> Key.Value {
+        /// Resolves the dependency directly from the live container, bypassing `testValue` or `previewValue`.
+        public func resolveLive() async throws -> Key.Value {
             let resolver = try await Dependency.resolver()
             return try await resolver.resolve(key)
         }

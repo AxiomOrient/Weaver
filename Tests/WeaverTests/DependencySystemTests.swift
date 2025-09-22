@@ -159,6 +159,32 @@ struct DependencySystemTests {
 
         await Dependency.reset()
     }
+
+    @Test("resolveLive() bypasses test context", .tags(.environment, .unit, .fast))
+    func testResolveLiveBypassesTestContext() async throws {
+        await Dependency.reset()
+        let counter = FactoryCallCounter()
+        try await Dependency.bootstrap(with: [ConcurrencyModule(counter: counter)])
+
+        let (liveResolved, testResolved) = try await Dependency.withContext(.test) {
+            let dependency = DependencyValue(SingletonServiceKey.self)
+
+            // resolveLive() should bypass the context and hit the container
+            let live = try await dependency.wrappedValue.resolveLive()
+
+            // Standard resolve() should use the context and return the static .testValue
+            let test = try await Dependency.resolve(SingletonServiceKey.self)
+
+            return (live, test)
+        }
+
+        let factoryCount = await counter.count()
+
+        #expect(factoryCount == 1, "Factory for live value should be called exactly once")
+        #expect(liveResolved.id != testResolved.id, "resolveLive() must return a different instance from the container, not the static testValue")
+
+        await Dependency.reset()
+    }
 }
 
 private func waitUntilWeakReferenceReleased(_ reference: WeakService?) async throws {
