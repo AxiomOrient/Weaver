@@ -6,14 +6,15 @@ import PackageDescription
 let package = Package(
     name: "Weaver",
     platforms: [
-        .iOS(.v15),
+        .iOS(.v16),
         .watchOS(.v8),
         .macOS(.v13)
     ],
     products: [
         .library(
             name: "Weaver",
-            targets: ["Weaver"]),
+            targets: ["Weaver"]
+        ),
     ],
     dependencies: [
         
